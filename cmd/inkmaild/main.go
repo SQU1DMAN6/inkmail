@@ -95,11 +95,13 @@ func main() {
 		}
 	}()
 
-	go network.DialPersistent(
-		*daddy,
-		id,
-		db,
-	)
+	if *daddy != "" {
+		go network.DialPersistent(
+			*daddy,
+			id,
+			db,
+		)
+	}
 
 	signals := make(chan os.Signal, 1)
 
