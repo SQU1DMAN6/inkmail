@@ -19,7 +19,10 @@ const (
 	magic        = "IML1"
 	maxFrameSize = 1024 * 1024
 	protocol     = 1
+
 	handshakeTag = "INKMAIL-HANDSHAKE-V1"
+
+	connectionTimeout = 10 * time.Second
 )
 
 type Message struct {
@@ -40,71 +43,115 @@ type HelloAck struct {
 	Signature string `json:"signature"`
 }
 
-func writeFrame(conn net.Conn, payload []byte) error {
+type Session struct {
+	Conn    net.Conn
+	Peer    []byte
+	Address string
+}
+
+func writeFrame(
+	conn net.Conn,
+	payload []byte,
+) error {
 	if len(payload) > maxFrameSize {
 		return fmt.Errorf("frame too large")
 	}
 
-	if _, err := conn.Write([]byte(magic)); err != nil {
+	if _, err := conn.Write(
+		[]byte(magic),
+	); err != nil {
 		return err
 	}
 
 	var length [4]byte
-	binary.BigEndian.PutUint32(length[:], uint32(len(payload)))
+
+	binary.BigEndian.PutUint32(
+		length[:],
+		uint32(len(payload)),
+	)
 
 	if _, err := conn.Write(length[:]); err != nil {
 		return err
 	}
 
 	_, err := conn.Write(payload)
+
 	return err
 }
 
-func readFrame(conn net.Conn) ([]byte, error) {
+func readFrame(
+	conn net.Conn,
+) ([]byte, error) {
 	header := make([]byte, 8)
 
-	if _, err := io.ReadFull(conn, header); err != nil {
+	if _, err := io.ReadFull(
+		conn,
+		header,
+	); err != nil {
 		return nil, err
 	}
 
 	if string(header[:4]) != magic {
-		return nil, fmt.Errorf("invalid protocol magic")
+		return nil, fmt.Errorf(
+			"invalid protocol magic",
+		)
 	}
 
-	length := binary.BigEndian.Uint32(header[4:])
+	length := binary.BigEndian.Uint32(
+		header[4:],
+	)
 
 	if length > maxFrameSize {
-		return nil, fmt.Errorf("frame too large")
+		return nil, fmt.Errorf(
+			"frame too large",
+		)
 	}
 
 	payload := make([]byte, length)
 
-	if _, err := io.ReadFull(conn, payload); err != nil {
+	if _, err := io.ReadFull(
+		conn,
+		payload,
+	); err != nil {
 		return nil, err
 	}
 
 	return payload, nil
 }
 
-func sendMessage(conn net.Conn, msg Message) error {
+func sendMessage(
+	conn net.Conn,
+	msg Message,
+) error {
 	payload, err := json.Marshal(msg)
 	if err != nil {
 		return err
 	}
 
-	return writeFrame(conn, payload)
+	return writeFrame(
+		conn,
+		payload,
+	)
 }
 
-func receiveMessage(conn net.Conn, msg *Message) error {
+func receiveMessage(
+	conn net.Conn,
+	msg *Message,
+) error {
 	payload, err := readFrame(conn)
 	if err != nil {
 		return err
 	}
 
-	return json.Unmarshal(payload, msg)
+	return json.Unmarshal(
+		payload,
+		msg,
+	)
 }
 
-func createHello(local *identity.Identity) (Hello, []byte, error) {
+func createHello(
+	local *identity.Identity,
+) (Hello, []byte, error) {
 	nonce := make([]byte, 32)
 
 	if _, err := rand.Read(nonce); err != nil {
@@ -112,9 +159,11 @@ func createHello(local *identity.Identity) (Hello, []byte, error) {
 	}
 
 	hello := Hello{
-		Version:   protocol,
-		PublicKey: hex.EncodeToString(local.PublicKey),
-		Nonce:     hex.EncodeToString(nonce),
+		Version: protocol,
+		PublicKey: hex.EncodeToString(
+			local.PublicKey,
+		),
+		Nonce: hex.EncodeToString(nonce),
 	}
 
 	return hello, nonce, nil
@@ -126,12 +175,30 @@ func signHandshake(
 	peerNonce []byte,
 	localNonce []byte,
 ) []byte {
-	data := append([]byte(handshakeTag), peerNonce...)
-	data = append(data, localNonce...)
-	data = append(data, peerPublic...)
-	data = append(data, local.PublicKey...)
+	data := append(
+		[]byte(handshakeTag),
+		peerNonce...,
+	)
 
-	return ed25519.Sign(local.PrivateKey, data)
+	data = append(
+		data,
+		localNonce...,
+	)
+
+	data = append(
+		data,
+		peerPublic...,
+	)
+
+	data = append(
+		data,
+		local.PublicKey...,
+	)
+
+	return ed25519.Sign(
+		local.PrivateKey,
+		data,
+	)
 }
 
 func verifyHandshake(
@@ -141,10 +208,25 @@ func verifyHandshake(
 	localNonce []byte,
 	signature []byte,
 ) bool {
-	data := append([]byte(handshakeTag), localNonce...)
-	data = append(data, peerNonce...)
-	data = append(data, localPublic...)
-	data = append(data, peerPublic...)
+	data := append(
+		[]byte(handshakeTag),
+		localNonce...,
+	)
+
+	data = append(
+		data,
+		peerNonce...,
+	)
+
+	data = append(
+		data,
+		localPublic...,
+	)
+
+	data = append(
+		data,
+		peerPublic...,
+	)
 
 	return ed25519.Verify(
 		ed25519.PublicKey(peerPublic),
@@ -167,10 +249,16 @@ func makeAck(
 	)
 
 	return HelloAck{
-		Version:   protocol,
-		PublicKey: hex.EncodeToString(local.PublicKey),
-		Nonce:     hex.EncodeToString(localNonce),
-		Signature: hex.EncodeToString(signature),
+		Version: protocol,
+		PublicKey: hex.EncodeToString(
+			local.PublicKey,
+		),
+		Nonce: hex.EncodeToString(
+			localNonce,
+		),
+		Signature: hex.EncodeToString(
+			signature,
+		),
 	}
 }
 
@@ -183,31 +271,45 @@ func performHandshake(
 		return nil, err
 	}
 
-	helloData, err := json.Marshal(localHello)
+	helloData, err := json.Marshal(
+		localHello,
+	)
 	if err != nil {
 		return nil, err
 	}
 
-	if err := sendMessage(conn, Message{
-		Type: "HELLO",
-		Data: helloData,
-	}); err != nil {
+	if err := sendMessage(
+		conn,
+		Message{
+			Type: "HELLO",
+			Data: helloData,
+		},
+	); err != nil {
 		return nil, err
 	}
 
 	var incoming Message
 
-	if err := receiveMessage(conn, &incoming); err != nil {
+	if err := receiveMessage(
+		conn,
+		&incoming,
+	); err != nil {
 		return nil, err
 	}
 
 	if incoming.Type != "HELLO" {
-		return nil, fmt.Errorf("expected HELLO, got %q", incoming.Type)
+		return nil, fmt.Errorf(
+			"expected HELLO, got %q",
+			incoming.Type,
+		)
 	}
 
 	var peerHello Hello
 
-	if err := json.Unmarshal(incoming.Data, &peerHello); err != nil {
+	if err := json.Unmarshal(
+		incoming.Data,
+		&peerHello,
+	); err != nil {
 		return nil, err
 	}
 
@@ -218,14 +320,23 @@ func performHandshake(
 		)
 	}
 
-	peerPublic, err := hex.DecodeString(peerHello.PublicKey)
-	if err != nil || len(peerPublic) != ed25519.PublicKeySize {
-		return nil, fmt.Errorf("invalid peer public key")
+	peerPublic, err := hex.DecodeString(
+		peerHello.PublicKey,
+	)
+	if err != nil ||
+		len(peerPublic) != ed25519.PublicKeySize {
+		return nil, fmt.Errorf(
+			"invalid peer public key",
+		)
 	}
 
-	peerNonce, err := hex.DecodeString(peerHello.Nonce)
+	peerNonce, err := hex.DecodeString(
+		peerHello.Nonce,
+	)
 	if err != nil || len(peerNonce) != 32 {
-		return nil, fmt.Errorf("invalid peer nonce")
+		return nil, fmt.Errorf(
+			"invalid peer nonce",
+		)
 	}
 
 	ack := makeAck(
@@ -240,16 +351,22 @@ func performHandshake(
 		return nil, err
 	}
 
-	if err := sendMessage(conn, Message{
-		Type: "HELLO_ACK",
-		Data: ackData,
-	}); err != nil {
+	if err := sendMessage(
+		conn,
+		Message{
+			Type: "HELLO_ACK",
+			Data: ackData,
+		},
+	); err != nil {
 		return nil, err
 	}
 
 	var incomingAck Message
 
-	if err := receiveMessage(conn, &incomingAck); err != nil {
+	if err := receiveMessage(
+		conn,
+		&incomingAck,
+	); err != nil {
 		return nil, err
 	}
 
@@ -262,8 +379,19 @@ func performHandshake(
 
 	var peerAck HelloAck
 
-	if err := json.Unmarshal(incomingAck.Data, &peerAck); err != nil {
+	if err := json.Unmarshal(
+		incomingAck.Data,
+		&peerAck,
+	); err != nil {
 		return nil, err
+	}
+
+	if peerAck.Version != protocol {
+		return nil, fmt.Errorf(
+			"unsupported peer ACK protocol version %d, expected %d",
+			peerAck.Version,
+			protocol,
+		)
 	}
 
 	if peerAck.PublicKey != peerHello.PublicKey {
@@ -278,9 +406,14 @@ func performHandshake(
 		)
 	}
 
-	peerSignature, err := hex.DecodeString(peerAck.Signature)
-	if err != nil {
-		return nil, fmt.Errorf("invalid peer signature")
+	peerSignature, err := hex.DecodeString(
+		peerAck.Signature,
+	)
+	if err != nil ||
+		len(peerSignature) != ed25519.SignatureSize {
+		return nil, fmt.Errorf(
+			"invalid peer signature",
+		)
 	}
 
 	if !verifyHandshake(
@@ -290,10 +423,52 @@ func performHandshake(
 		localNonce,
 		peerSignature,
 	) {
-		return nil, fmt.Errorf("invalid peer handshake signature")
+		return nil, fmt.Errorf(
+			"invalid peer handshake signature",
+		)
 	}
 
 	return peerPublic, nil
+}
+
+func authenticateConnection(
+	conn net.Conn,
+	local *identity.Identity,
+	db *database.Database,
+) (*Session, error) {
+	_ = conn.SetDeadline(
+		time.Now().Add(connectionTimeout),
+	)
+
+	peerPublic, err := performHandshake(
+		conn,
+		local,
+	)
+	if err != nil {
+		return nil, err
+	}
+
+	address := conn.RemoteAddr().String()
+
+	if err := db.UpsertPeer(
+		peerPublic,
+		address,
+	); err != nil {
+		return nil, fmt.Errorf(
+			"store peer: %w",
+			err,
+		)
+	}
+
+	_ = conn.SetDeadline(
+		time.Time{},
+	)
+
+	return &Session{
+		Conn:    conn,
+		Peer:    peerPublic,
+		Address: address,
+	}, nil
 }
 
 func HandleConnection(
@@ -303,28 +478,52 @@ func HandleConnection(
 ) error {
 	defer conn.Close()
 
-	_ = conn.SetDeadline(time.Now().Add(10 * time.Second))
-
-	peerPublic, err := performHandshake(conn, local)
+	session, err := authenticateConnection(
+		conn,
+		local,
+		db,
+	)
 	if err != nil {
 		return err
 	}
 
-	address := conn.RemoteAddr().String()
-
-	if err := db.UpsertPeer(peerPublic, address); err != nil {
-		return fmt.Errorf("store peer: %w", err)
-	}
-
-	_ = conn.SetDeadline(time.Time{})
-
 	fmt.Printf(
 		"authenticated peer %s from %s\n",
-		identity.Fingerprint(peerPublic),
-		address,
+		identity.Fingerprint(session.Peer),
+		session.Address,
 	)
 
-	return nil
+	return sessionLoop(session)
+}
+
+func sessionLoop(
+	session *Session,
+) error {
+	for {
+		var msg Message
+
+		if err := receiveMessage(
+			session.Conn,
+			&msg,
+		); err != nil {
+			if err == io.EOF {
+				return nil
+			}
+
+			return fmt.Errorf(
+				"receive from peer: %w",
+				err,
+			)
+		}
+
+		switch msg.Type {
+		default:
+			return fmt.Errorf(
+				"unsupported message type %q",
+				msg.Type,
+			)
+		}
+	}
 }
 
 func Dial(
@@ -335,30 +534,65 @@ func Dial(
 	conn, err := net.DialTimeout(
 		"tcp",
 		address,
-		10*time.Second,
+		connectionTimeout,
 	)
 	if err != nil {
-		return fmt.Errorf("connect to %s: %w", address, err)
+		return fmt.Errorf(
+			"connect to %s: %w",
+			address,
+			err,
+		)
 	}
 
-	defer conn.Close()
-
-	_ = conn.SetDeadline(time.Now().Add(10 * time.Second))
-
-	peerPublic, err := performHandshake(conn, local)
+	session, err := authenticateConnection(
+		conn,
+		local,
+		db,
+	)
 	if err != nil {
-		return fmt.Errorf("handshake with %s: %w", address, err)
-	}
+		conn.Close()
 
-	if err := db.UpsertPeer(peerPublic, address); err != nil {
-		return fmt.Errorf("store peer: %w", err)
+		return fmt.Errorf(
+			"handshake with %s: %w",
+			address,
+			err,
+		)
 	}
 
 	fmt.Printf(
 		"authenticated peer %s at %s\n",
-		identity.Fingerprint(peerPublic),
+		identity.Fingerprint(session.Peer),
 		address,
 	)
 
-	return nil
+	return sessionLoop(session)
+}
+
+func DialPersistent(
+	address string,
+	local *identity.Identity,
+	db *database.Database,
+) {
+	for {
+		err := Dial(
+			address,
+			local,
+			db,
+		)
+
+		if err != nil {
+			fmt.Printf(
+				"connection to %s failed: %v\n",
+				address,
+				err,
+			)
+		} else {
+			fmt.Printf(
+				"connection to %s closed\n",
+				address,
+			)
+		}
+
+		time.Sleep(5 * time.Second)
+	}
 }

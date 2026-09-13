@@ -15,12 +15,17 @@ type Database struct {
 func Open(path string) (*Database, error) {
 	db, err := sql.Open("sqlite", path)
 	if err != nil {
-		return nil, fmt.Errorf("open database: %w", err)
+		return nil, fmt.Errorf(
+			"open database: %w",
+			err,
+		)
 	}
 
 	db.SetMaxOpenConns(1)
 
-	d := &Database{DB: db}
+	d := &Database{
+		DB: db,
+	}
 
 	if err := d.init(); err != nil {
 		db.Close()
@@ -48,15 +53,62 @@ func (d *Database) init() error {
 	`
 
 	if _, err := d.DB.Exec(schema); err != nil {
-		return fmt.Errorf("initialise database: %w", err)
+		return fmt.Errorf(
+			"initialise database: %w",
+			err,
+		)
 	}
 
 	return nil
 }
 
-func (d *Database) UpsertPeer(publicKey []byte, address string) error {
+func (d *Database) SetMeta(
+	key string,
+	value string,
+) error {
 	_, err := d.DB.Exec(`
-		INSERT INTO peers(public_key, address, last_seen)
+		INSERT INTO node_meta(key, value)
+		VALUES (?, ?)
+		ON CONFLICT(key)
+		DO UPDATE SET value = excluded.value
+	`,
+		key,
+		value,
+	)
+
+	return err
+}
+
+func (d *Database) GetMeta(
+	key string,
+) (string, error) {
+	var value string
+
+	err := d.DB.QueryRow(`
+		SELECT value
+		FROM node_meta
+		WHERE key = ?
+	`,
+		key,
+	).Scan(&value)
+
+	if err != nil {
+		return "", err
+	}
+
+	return value, nil
+}
+
+func (d *Database) UpsertPeer(
+	publicKey []byte,
+	address string,
+) error {
+	_, err := d.DB.Exec(`
+		INSERT INTO peers(
+			public_key,
+			address,
+			last_seen
+		)
 		VALUES (?, ?, ?)
 		ON CONFLICT(public_key)
 		DO UPDATE SET

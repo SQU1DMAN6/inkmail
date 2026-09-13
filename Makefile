@@ -4,4 +4,10 @@ build:
 	go build -o build/inkmail ./cmd/inkmail/
 
 clean:
-	rm -r build/
+	rm -rf build/
+
+daemon:
+	go run ./cmd/inkmaild
+
+client:
+	go run ./cmd/inkmail

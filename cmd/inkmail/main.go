@@ -4,7 +4,9 @@ import (
 	"flag"
 	"fmt"
 	"os"
+	"os/signal"
 	"path/filepath"
+	"syscall"
 
 	"github.com/SQU1DMAN6/inkmail/internal/database"
 	"github.com/SQU1DMAN6/inkmail/internal/identity"
@@ -32,7 +34,11 @@ func main() {
 	}
 
 	if err := os.MkdirAll(*dataDir, 0700); err != nil {
-		fmt.Fprintf(os.Stderr, "create data directory: %v\n", err)
+		fmt.Fprintf(
+			os.Stderr,
+			"create data directory: %v\n",
+			err,
+		)
 		os.Exit(1)
 	}
 
@@ -42,7 +48,11 @@ func main() {
 		filepath.Join(*dataDir, "identity"),
 	)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "load identity: %v\n", err)
+		fmt.Fprintf(
+			os.Stderr,
+			"load identity: %v\n",
+			err,
+		)
 		os.Exit(1)
 	}
 
@@ -55,18 +65,36 @@ func main() {
 		filepath.Join(*dataDir, "node.db"),
 	)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "open database: %v\n", err)
+		fmt.Fprintf(
+			os.Stderr,
+			"open database: %v\n",
+			err,
+		)
 		os.Exit(1)
 	}
 
 	defer db.DB.Close()
 
-	fmt.Printf("Connecting to %s...\n", *address)
+	fmt.Printf(
+		"Connecting to %s...\n",
+		*address,
+	)
 
-	if err := network.Dial(*address, id, db); err != nil {
-		fmt.Fprintf(os.Stderr, "connection failed: %v\n", err)
-		os.Exit(1)
-	}
+	go network.DialPersistent(
+		*address,
+		id,
+		db,
+	)
 
-	fmt.Println("Connection established.")
+	signals := make(chan os.Signal, 1)
+
+	signal.Notify(
+		signals,
+		syscall.SIGINT,
+		syscall.SIGTERM,
+	)
+
+	<-signals
+
+	fmt.Println("Shutting down InkMail...")
 }
