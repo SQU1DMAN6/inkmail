@@ -12,7 +12,12 @@ import (
 )
 
 func main() {
-	port := flag.Int("port", 25252, "TCP listening port")
+	address := flag.String(
+		"connect",
+		"",
+		"address of an InkMail peer",
+	)
+
 	dataDir := flag.String(
 		"data",
 		filepath.Join(os.Getenv("HOME"), ".inkmail"),
@@ -21,17 +26,24 @@ func main() {
 
 	flag.Parse()
 
-	if err := os.MkdirAll(*dataDir, 0700); err != nil {
-		panic(err)
+	if *address == "" {
+		fmt.Println("Usage: inkmail --connect <host>:<port>")
+		os.Exit(1)
 	}
 
-	fmt.Println("Starting InkMail Daemon...")
+	if err := os.MkdirAll(*dataDir, 0700); err != nil {
+		fmt.Fprintf(os.Stderr, "create data directory: %v\n", err)
+		os.Exit(1)
+	}
+
+	fmt.Println("Starting InkMail Client...")
 
 	id, err := identity.LoadOrCreate(
 		filepath.Join(*dataDir, "identity"),
 	)
 	if err != nil {
-		panic(err)
+		fmt.Fprintf(os.Stderr, "load identity: %v\n", err)
+		os.Exit(1)
 	}
 
 	fmt.Printf(
@@ -43,14 +55,18 @@ func main() {
 		filepath.Join(*dataDir, "node.db"),
 	)
 	if err != nil {
-		panic(err)
+		fmt.Fprintf(os.Stderr, "open database: %v\n", err)
+		os.Exit(1)
 	}
 
 	defer db.DB.Close()
 
-	address := fmt.Sprintf("0.0.0.0:%d", *port)
+	fmt.Printf("Connecting to %s...\n", *address)
 
-	if err := network.Listen(address, id, db); err != nil {
-		panic(err)
+	if err := network.Dial(*address, id, db); err != nil {
+		fmt.Fprintf(os.Stderr, "connection failed: %v\n", err)
+		os.Exit(1)
 	}
+
+	fmt.Println("Connection established.")
 }
