@@ -22,18 +22,32 @@ func main() {
 
 	dataDir := flag.String(
 		"data",
-		filepath.Join(os.Getenv("HOME"), ".inkmail"),
+		filepath.Join(
+			os.Getenv("HOME"),
+			".inkmail",
+		),
 		"InkMail data directory",
+	)
+
+	namespace := flag.String(
+		"user",
+		"",
+		"identity namespace used on first launch",
 	)
 
 	flag.Parse()
 
 	if *address == "" {
-		fmt.Println("Usage: inkmail --connect <host>:<port>")
+		fmt.Println(
+			"Usage: inkmail --connect <host>:<port>",
+		)
 		os.Exit(1)
 	}
 
-	if err := os.MkdirAll(*dataDir, 0700); err != nil {
+	if err := os.MkdirAll(
+		*dataDir,
+		0700,
+	); err != nil {
 		fmt.Fprintf(
 			os.Stderr,
 			"create data directory: %v\n",
@@ -42,10 +56,16 @@ func main() {
 		os.Exit(1)
 	}
 
-	fmt.Println("Starting InkMail Client...")
+	fmt.Println(
+		"Starting InkMail Client...",
+	)
 
 	id, err := identity.LoadOrCreate(
-		filepath.Join(*dataDir, "identity"),
+		filepath.Join(
+			*dataDir,
+			"identity",
+		),
+		*namespace,
 	)
 	if err != nil {
 		fmt.Fprintf(
@@ -57,12 +77,15 @@ func main() {
 	}
 
 	fmt.Printf(
-		"Identity: qchef::%s.ed25519\n",
-		identity.Fingerprint(id.PublicKey),
+		"Identity: %s\n",
+		identity.Address(id),
 	)
 
 	db, err := database.Open(
-		filepath.Join(*dataDir, "node.db"),
+		filepath.Join(
+			*dataDir,
+			"node.db",
+		),
 	)
 	if err != nil {
 		fmt.Fprintf(
@@ -96,5 +119,7 @@ func main() {
 
 	<-signals
 
-	fmt.Println("Shutting down InkMail...")
+	fmt.Println(
+		"Shutting down InkMail...",
+	)
 }

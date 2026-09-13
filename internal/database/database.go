@@ -45,11 +45,26 @@ func (d *Database) init() error {
 		value TEXT NOT NULL
 	);
 
-	CREATE TABLE IF NOT EXISTS peers (
-		public_key BLOB PRIMARY KEY,
-		address TEXT NOT NULL,
-		last_seen INTEGER NOT NULL
+	/*
+		The legacy peers table may exist in databases created by
+		earlier versions. It is intentionally not used anymore because
+		it permanently associates public keys with network addresses.
+
+		We preserve it for compatibility rather than silently deleting
+		user data during startup.
+	*/
+
+	CREATE TABLE IF NOT EXISTS peer_identities (
+		namespace TEXT NOT NULL,
+		public_key BLOB NOT NULL,
+		first_seen INTEGER NOT NULL,
+		last_seen INTEGER NOT NULL,
+		PRIMARY KEY(namespace, public_key)
 	);
+
+	CREATE INDEX IF NOT EXISTS
+		idx_peer_identities_public_key
+	ON peer_identities(public_key);
 	`
 
 	if _, err := d.DB.Exec(schema); err != nil {
@@ -76,7 +91,15 @@ func (d *Database) SetMeta(
 		value,
 	)
 
-	return err
+	if err != nil {
+		return fmt.Errorf(
+			"set metadata %q: %w",
+			key,
+			err,
+		)
+	}
+
+	return nil
 }
 
 func (d *Database) GetMeta(
@@ -99,26 +122,36 @@ func (d *Database) GetMeta(
 	return value, nil
 }
 
-func (d *Database) UpsertPeer(
+func (d *Database) RecordPeerIdentity(
+	namespace string,
 	publicKey []byte,
-	address string,
 ) error {
+	now := time.Now().Unix()
+
 	_, err := d.DB.Exec(`
-		INSERT INTO peers(
+		INSERT INTO peer_identities(
+			namespace,
 			public_key,
-			address,
+			first_seen,
 			last_seen
 		)
-		VALUES (?, ?, ?)
-		ON CONFLICT(public_key)
+		VALUES (?, ?, ?, ?)
+		ON CONFLICT(namespace, public_key)
 		DO UPDATE SET
-			address = excluded.address,
 			last_seen = excluded.last_seen
 	`,
+		namespace,
 		publicKey,
-		address,
-		time.Now().Unix(),
+		now,
+		now,
 	)
 
-	return err
+	if err != nil {
+		return fmt.Errorf(
+			"record peer identity: %w",
+			err,
+		)
+	}
+
+	return nil
 }

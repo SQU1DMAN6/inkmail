@@ -32,21 +32,23 @@ type Message struct {
 
 type Hello struct {
 	Version   int    `json:"version"`
+	Namespace string `json:"namespace"`
 	PublicKey string `json:"public_key"`
 	Nonce     string `json:"nonce"`
 }
 
 type HelloAck struct {
 	Version   int    `json:"version"`
+	Namespace string `json:"namespace"`
 	PublicKey string `json:"public_key"`
 	Nonce     string `json:"nonce"`
 	Signature string `json:"signature"`
 }
 
 type Session struct {
-	Conn    net.Conn
-	Peer    []byte
-	Address string
+	Conn          net.Conn
+	Peer          []byte
+	PeerNamespace string
 }
 
 func writeFrame(
@@ -54,7 +56,9 @@ func writeFrame(
 	payload []byte,
 ) error {
 	if len(payload) > maxFrameSize {
-		return fmt.Errorf("frame too large")
+		return fmt.Errorf(
+			"frame too large",
+		)
 	}
 
 	if _, err := conn.Write(
@@ -159,7 +163,8 @@ func createHello(
 	}
 
 	hello := Hello{
-		Version: protocol,
+		Version:   protocol,
+		Namespace: local.Namespace,
 		PublicKey: hex.EncodeToString(
 			local.PublicKey,
 		),
@@ -169,30 +174,63 @@ func createHello(
 	return hello, nonce, nil
 }
 
+func handshakePayload(
+	signerNamespace string,
+	peerNamespace string,
+	localNamespace string,
+	peerPublic []byte,
+	localPublic []byte,
+	peerNonce []byte,
+	localNonce []byte,
+) []byte {
+	payload := make([]byte, 0)
+
+	appendField := func(field []byte) {
+		var length [4]byte
+
+		binary.BigEndian.PutUint32(
+			length[:],
+			uint32(len(field)),
+		)
+
+		payload = append(
+			payload,
+			length[:]...,
+		)
+
+		payload = append(
+			payload,
+			field...,
+		)
+	}
+
+	appendField([]byte(handshakeTag))
+	appendField([]byte(signerNamespace))
+	appendField([]byte(peerNamespace))
+	appendField([]byte(localNamespace))
+	appendField(peerPublic)
+	appendField(localPublic)
+	appendField(peerNonce)
+	appendField(localNonce)
+
+	return payload
+}
+
 func signHandshake(
 	local *identity.Identity,
+	peerNamespace string,
 	peerPublic []byte,
 	peerNonce []byte,
 	localNonce []byte,
 ) []byte {
-	data := append(
-		[]byte(handshakeTag),
-		peerNonce...,
-	)
-
-	data = append(
-		data,
-		localNonce...,
-	)
-
-	data = append(
-		data,
-		peerPublic...,
-	)
-
-	data = append(
-		data,
-		local.PublicKey...,
+	data := handshakePayload(
+		local.Namespace,
+		peerNamespace,
+		local.Namespace,
+		peerPublic,
+		local.PublicKey,
+		peerNonce,
+		localNonce,
 	)
 
 	return ed25519.Sign(
@@ -202,30 +240,22 @@ func signHandshake(
 }
 
 func verifyHandshake(
+	peerNamespace string,
+	localNamespace string,
 	peerPublic []byte,
 	localPublic []byte,
 	peerNonce []byte,
 	localNonce []byte,
 	signature []byte,
 ) bool {
-	data := append(
-		[]byte(handshakeTag),
-		localNonce...,
-	)
-
-	data = append(
-		data,
-		peerNonce...,
-	)
-
-	data = append(
-		data,
-		localPublic...,
-	)
-
-	data = append(
-		data,
-		peerPublic...,
+	data := handshakePayload(
+		peerNamespace,
+		localNamespace,
+		peerNamespace,
+		localPublic,
+		peerPublic,
+		localNonce,
+		peerNonce,
 	)
 
 	return ed25519.Verify(
@@ -237,19 +267,22 @@ func verifyHandshake(
 
 func makeAck(
 	local *identity.Identity,
+	peerNamespace string,
 	peerPublic []byte,
 	peerNonce []byte,
 	localNonce []byte,
 ) HelloAck {
 	signature := signHandshake(
 		local,
+		peerNamespace,
 		peerPublic,
 		peerNonce,
 		localNonce,
 	)
 
 	return HelloAck{
-		Version: protocol,
+		Version:   protocol,
+		Namespace: local.Namespace,
 		PublicKey: hex.EncodeToString(
 			local.PublicKey,
 		),
@@ -265,17 +298,17 @@ func makeAck(
 func performHandshake(
 	conn net.Conn,
 	local *identity.Identity,
-) ([]byte, error) {
+) ([]byte, string, error) {
 	localHello, localNonce, err := createHello(local)
 	if err != nil {
-		return nil, err
+		return nil, "", err
 	}
 
 	helloData, err := json.Marshal(
 		localHello,
 	)
 	if err != nil {
-		return nil, err
+		return nil, "", err
 	}
 
 	if err := sendMessage(
@@ -285,7 +318,7 @@ func performHandshake(
 			Data: helloData,
 		},
 	); err != nil {
-		return nil, err
+		return nil, "", err
 	}
 
 	var incoming Message
@@ -294,11 +327,11 @@ func performHandshake(
 		conn,
 		&incoming,
 	); err != nil {
-		return nil, err
+		return nil, "", err
 	}
 
 	if incoming.Type != "HELLO" {
-		return nil, fmt.Errorf(
+		return nil, "", fmt.Errorf(
 			"expected HELLO, got %q",
 			incoming.Type,
 		)
@@ -310,13 +343,22 @@ func performHandshake(
 		incoming.Data,
 		&peerHello,
 	); err != nil {
-		return nil, err
+		return nil, "", err
 	}
 
 	if peerHello.Version != protocol {
-		return nil, fmt.Errorf(
+		return nil, "", fmt.Errorf(
 			"unsupported protocol version %d",
 			peerHello.Version,
+		)
+	}
+
+	if err := identity.ValidateNamespace(
+		peerHello.Namespace,
+	); err != nil {
+		return nil, "", fmt.Errorf(
+			"invalid peer namespace: %w",
+			err,
 		)
 	}
 
@@ -325,7 +367,7 @@ func performHandshake(
 	)
 	if err != nil ||
 		len(peerPublic) != ed25519.PublicKeySize {
-		return nil, fmt.Errorf(
+		return nil, "", fmt.Errorf(
 			"invalid peer public key",
 		)
 	}
@@ -334,13 +376,14 @@ func performHandshake(
 		peerHello.Nonce,
 	)
 	if err != nil || len(peerNonce) != 32 {
-		return nil, fmt.Errorf(
+		return nil, "", fmt.Errorf(
 			"invalid peer nonce",
 		)
 	}
 
 	ack := makeAck(
 		local,
+		peerHello.Namespace,
 		peerPublic,
 		peerNonce,
 		localNonce,
@@ -348,7 +391,7 @@ func performHandshake(
 
 	ackData, err := json.Marshal(ack)
 	if err != nil {
-		return nil, err
+		return nil, "", err
 	}
 
 	if err := sendMessage(
@@ -358,7 +401,7 @@ func performHandshake(
 			Data: ackData,
 		},
 	); err != nil {
-		return nil, err
+		return nil, "", err
 	}
 
 	var incomingAck Message
@@ -367,11 +410,11 @@ func performHandshake(
 		conn,
 		&incomingAck,
 	); err != nil {
-		return nil, err
+		return nil, "", err
 	}
 
 	if incomingAck.Type != "HELLO_ACK" {
-		return nil, fmt.Errorf(
+		return nil, "", fmt.Errorf(
 			"expected HELLO_ACK, got %q",
 			incomingAck.Type,
 		)
@@ -383,25 +426,31 @@ func performHandshake(
 		incomingAck.Data,
 		&peerAck,
 	); err != nil {
-		return nil, err
+		return nil, "", err
 	}
 
 	if peerAck.Version != protocol {
-		return nil, fmt.Errorf(
+		return nil, "", fmt.Errorf(
 			"unsupported peer ACK protocol version %d, expected %d",
 			peerAck.Version,
 			protocol,
 		)
 	}
 
+	if peerAck.Namespace != peerHello.Namespace {
+		return nil, "", fmt.Errorf(
+			"peer namespace changed during handshake",
+		)
+	}
+
 	if peerAck.PublicKey != peerHello.PublicKey {
-		return nil, fmt.Errorf(
+		return nil, "", fmt.Errorf(
 			"peer identity changed during handshake",
 		)
 	}
 
 	if peerAck.Nonce != peerHello.Nonce {
-		return nil, fmt.Errorf(
+		return nil, "", fmt.Errorf(
 			"peer nonce changed during handshake",
 		)
 	}
@@ -411,24 +460,26 @@ func performHandshake(
 	)
 	if err != nil ||
 		len(peerSignature) != ed25519.SignatureSize {
-		return nil, fmt.Errorf(
+		return nil, "", fmt.Errorf(
 			"invalid peer signature",
 		)
 	}
 
 	if !verifyHandshake(
+		peerHello.Namespace,
+		local.Namespace,
 		peerPublic,
 		local.PublicKey,
 		peerNonce,
 		localNonce,
 		peerSignature,
 	) {
-		return nil, fmt.Errorf(
+		return nil, "", fmt.Errorf(
 			"invalid peer handshake signature",
 		)
 	}
 
-	return peerPublic, nil
+	return peerPublic, peerHello.Namespace, nil
 }
 
 func authenticateConnection(
@@ -440,7 +491,7 @@ func authenticateConnection(
 		time.Now().Add(connectionTimeout),
 	)
 
-	peerPublic, err := performHandshake(
+	peerPublic, peerNamespace, err := performHandshake(
 		conn,
 		local,
 	)
@@ -448,14 +499,12 @@ func authenticateConnection(
 		return nil, err
 	}
 
-	address := conn.RemoteAddr().String()
-
-	if err := db.UpsertPeer(
+	if err := db.RecordPeerIdentity(
+		peerNamespace,
 		peerPublic,
-		address,
 	); err != nil {
 		return nil, fmt.Errorf(
-			"store peer: %w",
+			"record peer identity: %w",
 			err,
 		)
 	}
@@ -465,9 +514,9 @@ func authenticateConnection(
 	)
 
 	return &Session{
-		Conn:    conn,
-		Peer:    peerPublic,
-		Address: address,
+		Conn:          conn,
+		Peer:          peerPublic,
+		PeerNamespace: peerNamespace,
 	}, nil
 }
 
@@ -488,9 +537,9 @@ func HandleConnection(
 	}
 
 	fmt.Printf(
-		"authenticated peer %s from %s\n",
+		"authenticated peer %s::%s\n",
+		session.PeerNamespace,
 		identity.Fingerprint(session.Peer),
-		session.Address,
 	)
 
 	return sessionLoop(session)
@@ -538,8 +587,7 @@ func Dial(
 	)
 	if err != nil {
 		return fmt.Errorf(
-			"connect to %s: %w",
-			address,
+			"connect to peer: %w",
 			err,
 		)
 	}
@@ -553,16 +601,15 @@ func Dial(
 		conn.Close()
 
 		return fmt.Errorf(
-			"handshake with %s: %w",
-			address,
+			"handshake failed: %w",
 			err,
 		)
 	}
 
 	fmt.Printf(
-		"authenticated peer %s at %s\n",
+		"authenticated peer %s::%s\n",
+		session.PeerNamespace,
 		identity.Fingerprint(session.Peer),
-		address,
 	)
 
 	return sessionLoop(session)
@@ -582,14 +629,12 @@ func DialPersistent(
 
 		if err != nil {
 			fmt.Printf(
-				"connection to %s failed: %v\n",
-				address,
+				"connection attempt failed: %v\n",
 				err,
 			)
 		} else {
-			fmt.Printf(
-				"connection to %s closed\n",
-				address,
+			fmt.Println(
+				"connection closed",
 			)
 		}
 
