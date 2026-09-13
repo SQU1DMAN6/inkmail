@@ -13,7 +13,7 @@ import (
 	"github.com/SQU1DMAN6/inkmail/internal/network"
 )
 
-const defaultDaddy = "129.150.63.22:25252"
+const defaultDaddy = "129.150.63.22:25565"
 
 func main() {
 	port := flag.Int(
