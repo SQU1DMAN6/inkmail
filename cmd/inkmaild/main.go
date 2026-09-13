@@ -1,0 +1,72 @@
+package main
+
+import (
+	"flag"
+	"fmt"
+	"os"
+	"path/filepath"
+
+	"github.com/SQU1DMAN6/inkmail/internal/database"
+	"github.com/SQU1DMAN6/inkmail/internal/identity"
+	"github.com/SQU1DMAN6/inkmail/internal/network"
+)
+
+func main() {
+	address := flag.String(
+		"connect",
+		"",
+		"address of an InkMail peer",
+	)
+
+	dataDir := flag.String(
+		"data",
+		filepath.Join(os.Getenv("HOME"), ".inkmail"),
+		"InkMail data directory",
+	)
+
+	flag.Parse()
+
+	if *address == "" {
+		fmt.Println("Usage: inkmail --connect <host>:<port>")
+		os.Exit(1)
+	}
+
+	if err := os.MkdirAll(*dataDir, 0700); err != nil {
+		fmt.Fprintf(os.Stderr, "create data directory: %v\n", err)
+		os.Exit(1)
+	}
+
+	fmt.Println("Starting InkMail client...")
+
+	id, err := identity.LoadOrCreate(
+		filepath.Join(*dataDir, "identity"),
+	)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "load identity: %v\n", err)
+		os.Exit(1)
+	}
+
+	fmt.Printf(
+		"Identity: qchef::%s.ed25519\n",
+		identity.Fingerprint(id.PublicKey),
+	)
+
+	db, err := database.Open(
+		filepath.Join(*dataDir, "node.db"),
+	)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "open database: %v\n", err)
+		os.Exit(1)
+	}
+
+	defer db.DB.Close()
+
+	fmt.Printf("Connecting to %s...\n", *address)
+
+	if err := network.Dial(*address, id, db); err != nil {
+		fmt.Fprintf(os.Stderr, "connection failed: %v\n", err)
+		os.Exit(1)
+	}
+
+	fmt.Println("Connection established.")
+}
