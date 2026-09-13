@@ -18,7 +18,7 @@ const defaultDaddy = "129.150.63.22:25565"
 func main() {
 	port := flag.Int(
 		"port",
-		25252,
+		25565,
 		"TCP listening port",
 	)
 
