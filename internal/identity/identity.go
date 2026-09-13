@@ -241,3 +241,20 @@ func Address(
 		Fingerprint(id.PublicKey),
 	)
 }
+
+func FingerprintFromHex(
+	publicKey string,
+) string {
+	decoded, err := hex.DecodeString(publicKey)
+	if err != nil {
+		return publicKey
+	}
+
+	if len(decoded) < 8 {
+		return hex.EncodeToString(decoded)
+	}
+
+	return hex.EncodeToString(
+		decoded[:8],
+	)
+}

@@ -47,7 +47,7 @@ type HelloAck struct {
 
 type Session struct {
 	Conn          net.Conn
-	Peer          []byte
+	Peer          ed25519.PublicKey
 	PeerNamespace string
 }
 
@@ -515,7 +515,7 @@ func authenticateConnection(
 
 	return &Session{
 		Conn:          conn,
-		Peer:          peerPublic,
+		Peer:          ed25519.PublicKey(peerPublic),
 		PeerNamespace: peerNamespace,
 	}, nil
 }
@@ -542,11 +542,17 @@ func HandleConnection(
 		identity.Fingerprint(session.Peer),
 	)
 
-	return sessionLoop(session)
+	return sessionLoop(
+		session,
+		local,
+		db,
+	)
 }
 
 func sessionLoop(
 	session *Session,
+	local *identity.Identity,
+	db *database.Database,
 ) error {
 	for {
 		var msg Message
@@ -566,6 +572,19 @@ func sessionLoop(
 		}
 
 		switch msg.Type {
+		case messageTypeSend:
+			if err := handleIncomingMessage(
+				session,
+				local,
+				db,
+				msg.Data,
+			); err != nil {
+				return fmt.Errorf(
+					"handle incoming message: %w",
+					err,
+				)
+			}
+
 		default:
 			return fmt.Errorf(
 				"unsupported message type %q",
@@ -579,14 +598,14 @@ func Dial(
 	address string,
 	local *identity.Identity,
 	db *database.Database,
-) error {
+) (*Session, error) {
 	conn, err := net.DialTimeout(
 		"tcp",
 		address,
 		connectionTimeout,
 	)
 	if err != nil {
-		return fmt.Errorf(
+		return nil, fmt.Errorf(
 			"connect to peer: %w",
 			err,
 		)
@@ -600,7 +619,7 @@ func Dial(
 	if err != nil {
 		conn.Close()
 
-		return fmt.Errorf(
+		return nil, fmt.Errorf(
 			"handshake failed: %w",
 			err,
 		)
@@ -612,7 +631,7 @@ func Dial(
 		identity.Fingerprint(session.Peer),
 	)
 
-	return sessionLoop(session)
+	return session, nil
 }
 
 func DialPersistent(
@@ -621,7 +640,7 @@ func DialPersistent(
 	db *database.Database,
 ) {
 	for {
-		err := Dial(
+		session, err := Dial(
 			address,
 			local,
 			db,
@@ -633,9 +652,24 @@ func DialPersistent(
 				err,
 			)
 		} else {
-			fmt.Println(
-				"connection closed",
+			err := sessionLoop(
+				session,
+				local,
+				db,
 			)
+
+			session.Conn.Close()
+
+			if err != nil {
+				fmt.Printf(
+					"persistent session closed: %v\n",
+					err,
+				)
+			} else {
+				fmt.Println(
+					"connection closed",
+				)
+			}
 		}
 
 		time.Sleep(5 * time.Second)
