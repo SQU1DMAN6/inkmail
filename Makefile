@@ -5,9 +5,3 @@ build:
 
 clean:
 	rm -rf build/
-
-daemon:
-	go run ./cmd/inkmaild
-
-client:
-	go run ./cmd/inkmail

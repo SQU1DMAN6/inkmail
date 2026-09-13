@@ -104,7 +104,7 @@ func main() {
 			"Daddy: disabled",
 		)
 	} else {
-		fmt.Printf(
+		fmt.Println(
 			"Daddy: configured",
 		)
 	}
