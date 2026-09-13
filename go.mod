@@ -1,6 +1,6 @@
 module github.com/SQU1DMAN6/inkmail
 
-go 1.27
+go 1.27.0
 
 require (
 	github.com/go-i2p/go-nat-listener v0.1.70001
