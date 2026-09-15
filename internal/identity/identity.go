@@ -1,6 +1,7 @@
 package identity
 
 import (
+	"crypto/ecdh"
 	"crypto/ed25519"
 	"crypto/rand"
 	"encoding/hex"
@@ -14,12 +15,20 @@ import (
 const (
 	defaultNamespace = "user"
 	maxNamespaceLen  = 64
+
+	// X25519 key sizes
+	x25519PrivateKeySize = 32
+	x25519PublicKeySize  = 32
 )
 
 type Identity struct {
 	Namespace  string
 	PublicKey  ed25519.PublicKey
 	PrivateKey ed25519.PrivateKey
+
+	// X25519 encryption keypair for end-to-end encryption
+	EncryptionPublicKey  []byte
+	EncryptionPrivateKey []byte
 }
 
 func LoadOrCreate(
@@ -51,6 +60,17 @@ func LoadOrCreate(
 		"public.key",
 	)
 
+	encPrivatePath := filepath.Join(
+		dir,
+		"enc_private.key",
+	)
+
+	encPublicPath := filepath.Join(
+		dir,
+		"enc_public.key",
+	)
+
+	// Load or generate Ed25519 keypair
 	private, err := os.ReadFile(privatePath)
 
 	if err == nil {
@@ -62,16 +82,77 @@ func LoadOrCreate(
 
 		public := private[ed25519.SeedSize:]
 
+		// Load or generate X25519 encryption keypair
+		encPrivate, err := os.ReadFile(encPrivatePath)
+		var encPrivateKey []byte
+		var encPublicKey []byte
+
+		if err == nil {
+			if len(encPrivate) != x25519PrivateKeySize {
+				return nil, fmt.Errorf(
+					"invalid encryption private key size",
+				)
+			}
+			encPrivateKey = append(
+				[]byte(nil),
+				encPrivate...,
+			)
+			// Derive public key from private key
+			ecdhPriv, err := ecdh.X25519().NewPrivateKey(encPrivateKey)
+			if err != nil {
+				return nil, fmt.Errorf(
+					"load encryption private key: %w",
+					err,
+				)
+			}
+			encPublicKey = ecdhPriv.PublicKey().Bytes()
+		} else if os.IsNotExist(err) {
+			// Generate new X25519 keypair
+			ecdhPriv, err := ecdh.X25519().GenerateKey(rand.Reader)
+			if err != nil {
+				return nil, fmt.Errorf(
+					"generate encryption key: %w",
+					err,
+				)
+			}
+			encPrivateKey = ecdhPriv.Bytes()
+			encPublicKey = ecdhPriv.PublicKey().Bytes()
+
+			// Persist encryption keys
+			if err := os.WriteFile(
+				encPrivatePath,
+				encPrivateKey,
+				0600,
+			); err != nil {
+				return nil, fmt.Errorf(
+					"write encryption private key: %w",
+					err,
+				)
+			}
+
+			if err := os.WriteFile(
+				encPublicPath,
+				encPublicKey,
+				0644,
+			); err != nil {
+				return nil, fmt.Errorf(
+					"write encryption public key: %w",
+					err,
+				)
+			}
+		} else {
+			return nil, fmt.Errorf(
+				"read encryption private key: %w",
+				err,
+			)
+		}
+
 		return &Identity{
-			Namespace: namespace,
-			PublicKey: append(
-				ed25519.PublicKey(nil),
-				public...,
-			),
-			PrivateKey: append(
-				ed25519.PrivateKey(nil),
-				private...,
-			),
+			Namespace:            namespace,
+			PublicKey:            append(ed25519.PublicKey(nil), public...),
+			PrivateKey:           append(ed25519.PrivateKey(nil), private...),
+			EncryptionPublicKey:  encPublicKey,
+			EncryptionPrivateKey: encPrivateKey,
 		}, nil
 	}
 
@@ -82,6 +163,7 @@ func LoadOrCreate(
 		)
 	}
 
+	// Generate new Ed25519 keypair
 	public, private, err := ed25519.GenerateKey(
 		rand.Reader,
 	)
@@ -114,10 +196,46 @@ func LoadOrCreate(
 		)
 	}
 
+	// Generate new X25519 encryption keypair
+	encdhPriv, err := ecdh.X25519().GenerateKey(rand.Reader)
+	if err != nil {
+		return nil, fmt.Errorf(
+			"generate encryption key: %w",
+			err,
+		)
+	}
+
+	encPrivateKey := append([]byte(nil), encdhPriv.Bytes()...)
+	encPublicKey := append([]byte(nil), encdhPriv.PublicKey().Bytes()...)
+
+	if err := os.WriteFile(
+		encPrivatePath,
+		encPrivateKey,
+		0600,
+	); err != nil {
+		return nil, fmt.Errorf(
+			"write encryption private key: %w",
+			err,
+		)
+	}
+
+	if err := os.WriteFile(
+		encPublicPath,
+		encPublicKey,
+		0644,
+	); err != nil {
+		return nil, fmt.Errorf(
+			"write encryption public key: %w",
+			err,
+		)
+	}
+
 	return &Identity{
-		Namespace:  namespace,
-		PublicKey:  public,
-		PrivateKey: private,
+		Namespace:            namespace,
+		PublicKey:            public,
+		PrivateKey:           private,
+		EncryptionPublicKey:  encPublicKey,
+		EncryptionPrivateKey: encPrivateKey,
 	}, nil
 }
 
@@ -257,4 +375,25 @@ func FingerprintFromHex(
 	return hex.EncodeToString(
 		decoded[:8],
 	)
+}
+
+// EncodeEncryptionPublicKey encodes the X25519 public key as hex
+func EncodeEncryptionPublicKey(key []byte) string {
+	return hex.EncodeToString(key)
+}
+
+// DecodeEncryptionPublicKey decodes a hex-encoded X25519 public key
+func DecodeEncryptionPublicKey(hexKey string) ([]byte, error) {
+	key, err := hex.DecodeString(hexKey)
+	if err != nil {
+		return nil, fmt.Errorf("invalid encryption public key: %w", err)
+	}
+	if len(key) != x25519PublicKeySize {
+		return nil, fmt.Errorf(
+			"invalid encryption public key size: got %d, want %d",
+			len(key),
+			x25519PublicKeySize,
+		)
+	}
+	return key, nil
 }

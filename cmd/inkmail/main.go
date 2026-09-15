@@ -2,10 +2,12 @@ package main
 
 import (
 	"bufio"
+	"encoding/hex"
 	"flag"
 	"fmt"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
@@ -29,12 +31,6 @@ func main() {
 		"user",
 		"",
 		"identity namespace used on first launch",
-	)
-
-	connectAddress := flag.String(
-		"connect",
-		"",
-		"connect to an InkMail peer when the client starts",
 	)
 
 	flag.Parse()
@@ -99,18 +95,6 @@ func main() {
 	client := &Client{
 		Identity: id,
 		Database: db,
-		Session:  nil,
-	}
-
-	if *connectAddress != "" {
-		if err := client.connect(
-			*connectAddress,
-		); err != nil {
-			fmt.Printf(
-				"connect: %v\n",
-				err,
-			)
-		}
 	}
 
 	client.repl()
@@ -176,26 +160,6 @@ func (c *Client) handleCommand(
 	case "peers":
 		c.printPeers()
 
-	case "connect":
-		if len(parts) != 2 {
-			fmt.Println(
-				"Usage: connect <host>:<port>",
-			)
-			return false
-		}
-
-		if err := c.connect(
-			parts[1],
-		); err != nil {
-			fmt.Printf(
-				"connect: %v\n",
-				err,
-			)
-		}
-
-	case "disconnect":
-		c.closeSession()
-
 	case "list":
 		if len(parts) != 2 ||
 			parts[1] != "messages" {
@@ -248,35 +212,35 @@ func (c *Client) printHelp() {
 	fmt.Println()
 }
 
-func (c *Client) connect(
-	address string,
-) error {
-	c.closeSession()
+// func (c *Client) connect(
+// 	address string,
+// ) error {
+// 	c.closeSession()
 
-	fmt.Printf(
-		"Connecting to %s...\n",
-		address,
-	)
+// 	fmt.Printf(
+// 		"Connecting to %s...\n",
+// 		address,
+// 	)
 
-	session, err := network.Dial(
-		address,
-		c.Identity,
-		c.Database,
-	)
-	if err != nil {
-		return err
-	}
+// 	session, err := network.Dial(
+// 		address,
+// 		c.Identity,
+// 		c.Database,
+// 	)
+// 	if err != nil {
+// 		return err
+// 	}
 
-	c.Session = session
+// 	c.Session = session
 
-	fmt.Printf(
-		"Connected to %s::%s\n",
-		session.PeerNamespace,
-		identity.Fingerprint(session.Peer),
-	)
+// 	fmt.Printf(
+// 		"Connected to %s::%s\n",
+// 		session.PeerNamespace,
+// 		identity.Fingerprint(session.Peer),
+// 	)
 
-	return nil
-}
+// 	return nil
+// }
 
 func (c *Client) closeSession() {
 	if c.Session == nil {
@@ -397,23 +361,112 @@ func (c *Client) openMessage(
 func (c *Client) sendInteractive(
 	reader *bufio.Reader,
 ) {
-	if c.Session == nil {
-		fmt.Println(
-			"No peer connection. Use 'connect <host>:<port>' first.",
+	// Get list of peers
+	peers, err := c.Database.ListPeerIdentities()
+	if err != nil {
+		fmt.Printf(
+			"list peers: %v\n",
+			err,
 		)
 		return
 	}
 
-	recipient := fmt.Sprintf(
-		"%s::%s",
-		c.Session.PeerNamespace,
-		identity.Fingerprint(c.Session.Peer),
-	)
+	if len(peers) == 0 {
+		fmt.Println(
+			"No known peers. Use 'peers' to see known identities.",
+		)
+		fmt.Println(
+			"Import a peer with their identity information first.",
+		)
+		return
+	}
 
-	fmt.Printf(
-		"Sending to %s\n",
-		recipient,
+	// Display peers with indexes
+	fmt.Println()
+	fmt.Println("Select recipient:")
+	fmt.Println()
+
+	for i, peer := range peers {
+		fingerprint := hex.EncodeToString(peer.PublicKey[:8])
+		fmt.Printf(
+			"%d. %s::%s\n",
+			i+1,
+			peer.Namespace,
+			fingerprint,
+		)
+	}
+
+	fmt.Println()
+	fmt.Print("Recipient (number or identity): ")
+
+	selection, err := reader.ReadString('\n')
+	if err != nil {
+		return
+	}
+
+	selection = strings.TrimSpace(selection)
+
+	// Parse selection
+	var selectedPeer *database.PeerIdentity
+	var recipientNamespace string
+	var recipientPublicKey []byte
+
+	// Try to parse as number first
+	if num, err := strconv.Atoi(selection); err == nil {
+		if num < 1 || num > len(peers) {
+			fmt.Println("Invalid selection.")
+			return
+		}
+		selectedPeer = &peers[num-1]
+		recipientNamespace = peers[num-1].Namespace
+		recipientPublicKey = peers[num-1].PublicKey
+	} else {
+		// Try to parse as identity string
+		// Format: namespace::fingerprint
+		for i, peer := range peers {
+			fingerprint := hex.EncodeToString(peer.PublicKey[:8])
+			expectedIdentity := fmt.Sprintf(
+				"%s::%s",
+				peer.Namespace,
+				fingerprint,
+			)
+			if strings.EqualFold(selection, expectedIdentity) {
+				selectedPeer = &peers[i]
+				recipientNamespace = peers[i].Namespace
+				recipientPublicKey = peers[i].PublicKey
+				break
+			}
+		}
+
+		if selectedPeer == nil {
+			// Try matching by namespace only (fuzzy match)
+			for _, peer := range peers {
+				if strings.EqualFold(selection, peer.Namespace) {
+					selectedPeer = &peer
+					recipientNamespace = peer.Namespace
+					recipientPublicKey = peer.PublicKey
+					break
+				}
+			}
+		}
+
+		if selectedPeer == nil {
+			fmt.Println("Peer not found.")
+			return
+		}
+	}
+
+	if selectedPeer == nil {
+		fmt.Println("No peer selected.")
+		return
+	}
+
+	// Get message details
+	fmt.Printf("\nSending to %s::%s\n",
+		recipientNamespace,
+		hex.EncodeToString(recipientPublicKey[:8]),
 	)
+	fmt.Println()
 
 	fmt.Print("Subject: ")
 
@@ -425,9 +478,7 @@ func (c *Client) sendInteractive(
 	subject = strings.TrimSpace(subject)
 
 	if subject == "" {
-		fmt.Println(
-			"Subject cannot be empty.",
-		)
+		fmt.Println("Subject cannot be empty.")
 		return
 	}
 
@@ -443,14 +494,8 @@ func (c *Client) sendInteractive(
 			return
 		}
 
-		line = strings.TrimSuffix(
-			line,
-			"\n",
-		)
-		line = strings.TrimSuffix(
-			line,
-			"\r",
-		)
+		line = strings.TrimSuffix(line, "\n")
+		line = strings.TrimSuffix(line, "\r")
 
 		if line == "." {
 			break
@@ -460,48 +505,117 @@ func (c *Client) sendInteractive(
 		body.WriteByte('\n')
 	}
 
-	msg, err := message.New(
-		c.Identity,
-		c.Session.PeerNamespace,
-		c.Session.Peer,
+	// Create and send the message using ghost networking
+	fmt.Println()
+	fmt.Println("Sending message...")
+	fmt.Println()
+
+	if err := c.sendMessageToPeer(
+		recipientNamespace,
+		recipientPublicKey,
 		subject,
 		body.String(),
+	); err != nil {
+		fmt.Printf("Send failed: %v\n", err)
+		fmt.Println()
+		return
+	}
+
+	fmt.Println("Message sent successfully.")
+	fmt.Println()
+}
+
+// sendMessageToPeer implements ghost networking:
+// 1. Find route to peer
+// 2. Dial peer (or Daddy if no direct route)
+// 3. Handshake (authenticate and exchange encryption keys)
+// 4. Send encrypted message
+// 5. Wait for ACK
+// 6. Close connection
+func (c *Client) sendMessageToPeer(
+	recipientNamespace string,
+	recipientPublicKey []byte,
+	subject string,
+	body string,
+) error {
+	// Create the message
+	msg, err := message.New(
+		c.Identity,
+		recipientNamespace,
+		recipientPublicKey,
+		subject,
+		body,
 	)
 	if err != nil {
-		fmt.Printf(
-			"create message: %v\n",
-			err,
-		)
-		return
+		return fmt.Errorf("create message: %w", err)
 	}
 
-	fmt.Printf(
-		"Message ID: %s\n",
-		msg.ID,
-	)
+	fmt.Printf("Message ID: %s\n", msg.ID)
+	fmt.Println()
 
-	if err := network.SendMessage(
-		c.Session,
+	// Attempt to send via ghost connection
+	// This will try direct connection first, then Daddy if needed
+	addr, err := network.ResolveAndSend(
+		c.Identity,
 		c.Database,
+		recipientNamespace,
+		recipientPublicKey,
 		msg,
-	); err != nil {
-		fmt.Printf(
-			"send message: %v\n",
-			err,
-		)
-		return
+	)
+	if err != nil {
+		return fmt.Errorf("send message: %w", err)
 	}
 
-	fmt.Println(
-		"Message delivered and acknowledged.",
-	)
+	if addr != nil {
+		fmt.Printf("Delivered via: %s\n", addr.Address)
+	} else {
+		fmt.Println("Message held for delivery (recipient offline).")
+	}
+
+	return nil
 }
 
 func (c *Client) printPeers() {
-	fmt.Println(
-		"Known peers are stored by identity, not network address.",
+	peers, err := c.Database.ListPeerIdentities()
+	if err != nil {
+		fmt.Printf(
+			"list peers: %v\n",
+			err,
+		)
+		return
+	}
+
+	if len(peers) == 0 {
+		fmt.Println()
+		fmt.Println("No known peers.")
+		fmt.Println()
+		fmt.Println(
+			"Use 'invite <address>' to exchange identities with another InkMail node.",
+		)
+		fmt.Println()
+		return
+	}
+
+	fmt.Println()
+	fmt.Println("Known peers:")
+	fmt.Println()
+
+	for i, peer := range peers {
+		fingerprint := identity.FingerprintFromHex(
+			hex.EncodeToString(peer.PublicKey),
+		)
+		fmt.Printf(
+			"%d. %s::%s\n",
+			i+1,
+			peer.Namespace,
+			fingerprint,
+		)
+	}
+
+	fmt.Println()
+	fmt.Printf(
+		"%d peer(s)\n",
+		len(peers),
 	)
-	fmt.Println(
-		"Peer listing is not implemented as a database query yet.",
-	)
+	fmt.Println()
 }

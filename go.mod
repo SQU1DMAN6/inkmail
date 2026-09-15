@@ -2,7 +2,10 @@ module github.com/SQU1DMAN6/inkmail
 
 go 1.27.0
 
-require modernc.org/sqlite v1.58.0
+require (
+	golang.org/x/crypto v0.57.0
+	modernc.org/sqlite v1.58.0
+)
 
 require (
 	github.com/dustin/go-humanize v1.0.1 // indirect

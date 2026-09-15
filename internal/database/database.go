@@ -3,6 +3,7 @@ package database
 import (
 	"database/sql"
 	"fmt"
+	"strings"
 	"time"
 
 	_ "modernc.org/sqlite"
@@ -57,6 +58,7 @@ func (d *Database) init() error {
 	CREATE TABLE IF NOT EXISTS peer_identities (
 		namespace TEXT NOT NULL,
 		public_key BLOB NOT NULL,
+		encryption_public_key BLOB,
 		first_seen INTEGER NOT NULL,
 		last_seen INTEGER NOT NULL,
 		PRIMARY KEY(namespace, public_key)
@@ -65,6 +67,19 @@ func (d *Database) init() error {
 	CREATE INDEX IF NOT EXISTS
 		idx_peer_identities_public_key
 	ON peer_identities(public_key);
+
+	CREATE TABLE IF NOT EXISTS peer_routes (
+		namespace TEXT NOT NULL,
+		public_key BLOB NOT NULL,
+		address TEXT NOT NULL,
+		expires_at INTEGER NOT NULL,
+		last_seen INTEGER NOT NULL,
+		PRIMARY KEY(namespace, public_key, address)
+	);
+
+	CREATE INDEX IF NOT EXISTS
+		idx_peer_routes_expiry
+	ON peer_routes(expires_at);
 
 	CREATE TABLE IF NOT EXISTS messages (
 		id TEXT PRIMARY KEY,
@@ -88,6 +103,22 @@ func (d *Database) init() error {
 	CREATE INDEX IF NOT EXISTS
 		idx_messages_direction
 	ON messages(direction);
+
+	CREATE TABLE IF NOT EXISTS held_messages (
+		id TEXT PRIMARY KEY,
+		sender_namespace TEXT NOT NULL,
+		sender_public_key BLOB NOT NULL,
+		recipient_namespace TEXT NOT NULL,
+		recipient_public_key BLOB NOT NULL,
+		payload BLOB NOT NULL,
+		created_at INTEGER NOT NULL,
+		expires_at INTEGER NOT NULL,
+		stored_at INTEGER NOT NULL
+	);
+
+	CREATE INDEX IF NOT EXISTS
+		idx_held_messages_expires_at
+	ON held_messages(expires_at);
 	`
 
 	if _, err := d.DB.Exec(schema); err != nil {
@@ -97,7 +128,48 @@ func (d *Database) init() error {
 		)
 	}
 
+	if err := d.migrate(); err != nil {
+		return err
+	}
+
 	return nil
+}
+
+// migrate applies additive schema upgrades to databases created by
+// earlier InkMail releases. All migrations must be idempotent.
+func (d *Database) migrate() error {
+	migrations := []string{
+		`ALTER TABLE peer_identities
+		 ADD COLUMN encryption_public_key BLOB`,
+	}
+
+	for _, statement := range migrations {
+		if _, err := d.DB.Exec(statement); err != nil {
+			if isDuplicateColumnError(err) {
+				continue
+			}
+
+			return fmt.Errorf(
+				"apply migration: %w",
+				err,
+			)
+		}
+	}
+
+	return nil
+}
+
+func isDuplicateColumnError(err error) bool {
+	if err == nil {
+		return false
+	}
+
+	message := err.Error()
+
+	return strings.Contains(
+		message,
+		"duplicate column name",
+	)
 }
 
 func (d *Database) SetMeta(
@@ -145,9 +217,26 @@ func (d *Database) GetMeta(
 	return value, nil
 }
 
+// RecordPeerIdentity stores or refreshes a known peer identity. The peer's
+// X25519 encryption public key is optional; when supplied it is persisted so
+// that end-to-end encrypted messages can later be addressed to the peer.
 func (d *Database) RecordPeerIdentity(
 	namespace string,
 	publicKey []byte,
+) error {
+	return d.RecordPeerIdentityWithKey(
+		namespace,
+		publicKey,
+		nil,
+	)
+}
+
+// RecordPeerIdentityWithKey stores or refreshes a known peer identity together
+// with the peer's published X25519 encryption public key.
+func (d *Database) RecordPeerIdentityWithKey(
+	namespace string,
+	publicKey []byte,
+	encryptionPublicKey []byte,
 ) error {
 	now := time.Now().Unix()
 
@@ -155,16 +244,22 @@ func (d *Database) RecordPeerIdentity(
 		INSERT INTO peer_identities(
 			namespace,
 			public_key,
+			encryption_public_key,
 			first_seen,
 			last_seen
 		)
-		VALUES (?, ?, ?, ?)
+		VALUES (?, ?, ?, ?, ?)
 		ON CONFLICT(namespace, public_key)
 		DO UPDATE SET
+			encryption_public_key = COALESCE(
+				excluded.encryption_public_key,
+				peer_identities.encryption_public_key
+			),
 			last_seen = excluded.last_seen
 	`,
 		namespace,
 		publicKey,
+		encryptionPublicKey,
 		now,
 		now,
 	)
@@ -177,6 +272,111 @@ func (d *Database) RecordPeerIdentity(
 	}
 
 	return nil
+}
+
+// ListPeerIdentities returns all known peer identities
+// ordered by namespace, public_key for deterministic results
+func (d *Database) ListPeerIdentities() ([]PeerIdentity, error) {
+	rows, err := d.DB.Query(`
+		SELECT
+			namespace,
+			public_key,
+			encryption_public_key,
+			first_seen,
+			last_seen
+		FROM peer_identities
+		ORDER BY namespace, public_key
+	`)
+	if err != nil {
+		return nil, fmt.Errorf("list peer identities: %w", err)
+	}
+	defer rows.Close()
+
+	peers := make([]PeerIdentity, 0)
+
+	for rows.Next() {
+		var (
+			peer          PeerIdentity
+			encryptionKey []byte
+		)
+
+		if err := rows.Scan(
+			&peer.Namespace,
+			&peer.PublicKey,
+			&encryptionKey,
+			&peer.FirstSeen,
+			&peer.LastSeen,
+		); err != nil {
+			return nil, fmt.Errorf("scan peer identity: %w", err)
+		}
+
+		peer.EncryptionPublicKey = encryptionKey
+
+		peers = append(peers, peer)
+	}
+
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+
+	return peers, nil
+}
+
+// GetPeerIdentity returns a single known peer identity by namespace and
+// Ed25519 public key.
+func (d *Database) GetPeerIdentity(
+	namespace string,
+	publicKey []byte,
+) (*PeerIdentity, error) {
+	peers, err := d.ListPeerIdentities()
+	if err != nil {
+		return nil, err
+	}
+
+	for i := range peers {
+		if peers[i].Namespace != namespace {
+			continue
+		}
+
+		if !bytesEqual(
+			peers[i].PublicKey,
+			publicKey,
+		) {
+			continue
+		}
+
+		return &peers[i], nil
+	}
+
+	return nil, fmt.Errorf(
+		"peer identity not found",
+	)
+}
+
+func bytesEqual(
+	a []byte,
+	b []byte,
+) bool {
+	if len(a) != len(b) {
+		return false
+	}
+
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+
+	return true
+}
+
+// PeerIdentity represents a known peer identity
+type PeerIdentity struct {
+	Namespace           string
+	PublicKey           []byte
+	EncryptionPublicKey []byte
+	FirstSeen           int64
+	LastSeen            int64
 }
 
 func (d *Database) StoreMessage(
@@ -522,4 +722,335 @@ func hexDigit(value byte) (byte, bool) {
 	default:
 		return 0, false
 	}
+}
+
+// HeldMessage represents a message stored for hold-and-forward delivery
+type HeldMessage struct {
+	ID                 string
+	SenderNamespace    string
+	SenderPublicKey    []byte
+	RecipientNamespace string
+	RecipientPublicKey []byte
+	Payload            []byte
+	CreatedAt          int64
+	ExpiresAt          int64
+	StoredAt           int64
+}
+
+// StoreHeldMessage stores an encrypted message for hold-and-forward delivery
+func (d *Database) StoreHeldMessage(id string, senderNamespace string, senderPublicKey []byte,
+	recipientNamespace string, recipientPublicKey []byte, payload []byte,
+	createdAt int64, expiresAt int64) error {
+	_, err := d.DB.Exec(`
+		INSERT INTO held_messages(id, sender_namespace, sender_public_key,
+			recipient_namespace, recipient_public_key, payload, created_at, expires_at, stored_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+		ON CONFLICT(id) DO NOTHING
+	`, id, senderNamespace, senderPublicKey, recipientNamespace, recipientPublicKey,
+		payload, createdAt, expiresAt, time.Now().Unix())
+
+	if err != nil {
+		return fmt.Errorf("store held message: %w", err)
+	}
+
+	return nil
+}
+
+// GetHeldMessagesForRecipient retrieves all held messages for a specific recipient
+func (d *Database) GetHeldMessagesForRecipient(recipientPublicKey []byte) ([]HeldMessage, error) {
+	rows, err := d.DB.Query(`
+		SELECT id, sender_namespace, sender_public_key, recipient_namespace,
+		       recipient_public_key, payload, created_at, expires_at, stored_at
+		FROM held_messages
+		WHERE recipient_public_key = ?
+		ORDER BY created_at ASC
+	`, recipientPublicKey)
+	if err != nil {
+		return nil, fmt.Errorf("query held messages: %w", err)
+	}
+	defer rows.Close()
+
+	var messages []HeldMessage
+	for rows.Next() {
+		var hm HeldMessage
+		err := rows.Scan(&hm.ID, &hm.SenderNamespace, &hm.SenderPublicKey,
+			&hm.RecipientNamespace, &hm.RecipientPublicKey, &hm.Payload,
+			&hm.CreatedAt, &hm.ExpiresAt, &hm.StoredAt)
+		if err != nil {
+			return nil, fmt.Errorf("scan held message: %w", err)
+		}
+		messages = append(messages, hm)
+	}
+
+	return messages, rows.Err()
+}
+
+// DeleteHeldMessage removes a held message after successful delivery
+func (d *Database) DeleteHeldMessage(id string) error {
+	_, err := d.DB.Exec(`
+		DELETE FROM held_messages WHERE id = ?
+	`, id)
+	if err != nil {
+		return fmt.Errorf("delete held message: %w", err)
+	}
+	return nil
+}
+
+// DeleteExpiredHeldMessages removes held messages that have expired (30-day TTL)
+func (d *Database) DeleteExpiredHeldMessages() error {
+	_, err := d.DB.Exec(`
+		DELETE FROM held_messages
+		WHERE expires_at <= ?
+	`, time.Now().Unix())
+	if err != nil {
+		return fmt.Errorf("delete expired held messages: %w", err)
+	}
+	return nil
+}
+
+// CountHeldMessages returns the number of held messages in the database
+func (d *Database) CountHeldMessages() (int, error) {
+	var count int
+	err := d.DB.QueryRow(`
+		SELECT COUNT(*) FROM held_messages
+	`).Scan(&count)
+	if err != nil {
+		return 0, fmt.Errorf("count held messages: %w", err)
+	}
+	return count, nil
+}
+
+// HeldMessageExists reports whether a held message with the given ID is
+// already stored. It is used to make hold-and-forward delivery idempotent.
+func (d *Database) HeldMessageExists(id string) (bool, error) {
+	var count int
+
+	err := d.DB.QueryRow(`
+		SELECT COUNT(*) FROM held_messages WHERE id = ?
+	`, id).Scan(&count)
+	if err != nil {
+		return false, fmt.Errorf(
+			"check held message: %w",
+			err,
+		)
+	}
+
+	return count > 0, nil
+}
+
+// GetHeldMessage retrieves a single held message by ID.
+func (d *Database) GetHeldMessage(id string) (*HeldMessage, error) {
+	row := d.DB.QueryRow(`
+		SELECT
+			id,
+			sender_namespace,
+			sender_public_key,
+			recipient_namespace,
+			recipient_public_key,
+			payload,
+			created_at,
+			expires_at,
+			stored_at
+		FROM held_messages
+		WHERE id = ?
+	`, id)
+
+	var hm HeldMessage
+
+	err := row.Scan(
+		&hm.ID,
+		&hm.SenderNamespace,
+		&hm.SenderPublicKey,
+		&hm.RecipientNamespace,
+		&hm.RecipientPublicKey,
+		&hm.Payload,
+		&hm.CreatedAt,
+		&hm.ExpiresAt,
+		&hm.StoredAt,
+	)
+	if err != nil {
+		if err == sql.ErrNoRows {
+			return nil, fmt.Errorf(
+				"held message %q not found",
+				id,
+			)
+		}
+
+		return nil, fmt.Errorf(
+			"get held message: %w",
+			err,
+		)
+	}
+
+	return &hm, nil
+}
+
+// Route is a temporary, expiring description of how a peer can be reached.
+type Route struct {
+	Namespace string
+	PublicKey []byte
+	Address   string
+	ExpiresAt int64
+	LastSeen  int64
+}
+
+// StoreRoute records or refreshes a temporary route to a peer.
+func (d *Database) StoreRoute(
+	namespace string,
+	publicKey []byte,
+	address string,
+	expiresAt int64,
+) error {
+	now := time.Now().Unix()
+
+	_, err := d.DB.Exec(`
+		INSERT INTO peer_routes(
+			namespace,
+			public_key,
+			address,
+			expires_at,
+			last_seen
+		)
+		VALUES (?, ?, ?, ?, ?)
+		ON CONFLICT(namespace, public_key, address)
+		DO UPDATE SET
+			expires_at = excluded.expires_at,
+			last_seen = excluded.last_seen
+	`,
+		namespace,
+		publicKey,
+		address,
+		expiresAt,
+		now,
+	)
+	if err != nil {
+		return fmt.Errorf(
+			"store peer route: %w",
+			err,
+		)
+	}
+
+	return nil
+}
+
+// GetRoute returns the newest unexpired route for a peer, or an error when
+// no usable route is available.
+func (d *Database) GetRoute(
+	namespace string,
+	publicKey []byte,
+) (*Route, error) {
+	routes, err := d.ListRoutes(
+		namespace,
+		publicKey,
+	)
+	if err != nil {
+		return nil, err
+	}
+
+	if len(routes) == 0 {
+		return nil, fmt.Errorf(
+			"no route for %s",
+			namespace,
+		)
+	}
+
+	return &routes[0], nil
+}
+
+// ListRoutes returns all unexpired routes for a peer ordered by expiry, so
+// that the freshest route is returned first.
+func (d *Database) ListRoutes(
+	namespace string,
+	publicKey []byte,
+) ([]Route, error) {
+	now := time.Now().Unix()
+
+	rows, err := d.DB.Query(`
+		SELECT
+			namespace,
+			public_key,
+			address,
+			expires_at,
+			last_seen
+		FROM peer_routes
+		WHERE namespace = ?
+		  AND public_key = ?
+		  AND expires_at > ?
+		ORDER BY expires_at DESC, last_seen DESC
+	`,
+		namespace,
+		publicKey,
+		now,
+	)
+	if err != nil {
+		return nil, fmt.Errorf(
+			"list peer routes: %w",
+			err,
+		)
+	}
+	defer rows.Close()
+
+	routes := make([]Route, 0)
+
+	for rows.Next() {
+		var route Route
+
+		if err := rows.Scan(
+			&route.Namespace,
+			&route.PublicKey,
+			&route.Address,
+			&route.ExpiresAt,
+			&route.LastSeen,
+		); err != nil {
+			return nil, fmt.Errorf(
+				"scan peer route: %w",
+				err,
+			)
+		}
+
+		routes = append(routes, route)
+	}
+
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+
+	return routes, nil
+}
+
+// DeleteExpiredRoutes removes routes whose expiry has passed.
+func (d *Database) DeleteExpiredRoutes() error {
+	_, err := d.DB.Exec(`
+		DELETE FROM peer_routes
+		WHERE expires_at <= ?
+	`, time.Now().Unix())
+	if err != nil {
+		return fmt.Errorf(
+			"delete expired routes: %w",
+			err,
+		)
+	}
+
+	return nil
+}
+
+// DeleteAllRoutesForPeer removes every route advertised by a peer. This is
+// used when a peer is no longer reachable at previously recorded addresses.
+func (d *Database) DeleteAllRoutesForPeer(
+	namespace string,
+	publicKey []byte,
+) error {
+	_, err := d.DB.Exec(`
+		DELETE FROM peer_routes
+		WHERE namespace = ?
+		  AND public_key = ?
+	`, namespace, publicKey)
+	if err != nil {
+		return fmt.Errorf(
+			"delete peer routes: %w",
+			err,
+		)
+	}
+
+	return nil
 }
