@@ -251,7 +251,7 @@ func handleRegisterRoute(
 		)
 	}
 
-	if err := db.StoreRoute(
+	if err := db.RegisterOrReplaceRoute(
 		registration.Namespace,
 		[]byte(session.Peer),
 		registration.Address,
@@ -373,6 +373,11 @@ func replyHold(
 // Daddy stores ciphertext only. It validates the envelope's signature and the
 // identity of the peer that actually completed the handshake, but it can never
 // read the subject or the body (SPEC section 43).
+//
+// A sibling Daddy forwarding on behalf of the original sender is also
+// accepted: the envelope signature still proves the sender, and the forwarder
+// is an authenticated peer whose identity is recorded for abuse tracing.
+// The envelope itself is never re-signed or decrypted.
 func handleHoldMessage(
 	session *Session,
 	local *identity.Identity,
@@ -389,12 +394,18 @@ func handleHoldMessage(
 		return replyHold(session, envelope.ID, statusRejected, err.Error())
 	}
 
+	// Direct senders must prove they own the sender identity. Sibling
+	// Daddies relaying a validly-signed envelope are accepted as forwarders
+	// (SPEC v0.5 section 20): the envelope signature still authenticates the
+	// original sender, and the forwarder is itself handshake-authenticated.
 	if err := verifySessionIdentity(
 		session,
 		envelope.SenderNamespace,
 		envelope.SenderPublicKey,
 	); err != nil {
-		return replyHold(session, envelope.ID, statusRejected, err.Error())
+		if !isAuthenticatedForwarder(session, db, envelope) {
+			return replyHold(session, envelope.ID, statusRejected, err.Error())
+		}
 	}
 
 	// Message IDs are idempotent (SPEC section 26). Re-offering the same
@@ -842,9 +853,9 @@ func RegisterRouteWithDaddy(
 		return fmt.Errorf("Daddy rejected route: %s", ack.Reason)
 	}
 
-	// Remember our own route locally as well, so this node can be found by
-	// peers that already know the address.
-	if err := db.StoreRoute(
+	// Remember our own route locally as well, superseding any stale address
+	// this node previously advertised (SPEC v0.5 Test I).
+	if err := db.RegisterOrReplaceRoute(
 		local.Namespace,
 		[]byte(local.PublicKey),
 		address,
@@ -947,9 +958,10 @@ func LookupRouteWithDaddy(
 		)
 	}
 
-	// Cache the route locally so later sends avoid Daddy entirely.
+	// Cache the route locally so later sends avoid Daddy entirely. The new
+	// registration supersedes any stale address (SPEC v0.5 Test I).
 	if route.ExpiresAt > time.Now().Unix() {
-		_ = db.StoreRoute(
+		_ = db.RegisterOrReplaceRoute(
 			namespace,
 			publicKey,
 			route.Address,
@@ -1020,6 +1032,19 @@ func SendHoldMessage(
 			ack.Reason,
 		)
 	}
+}
+
+// forwardHoldMessage hands one held envelope to a sibling Daddy. It reuses
+// the HOLD_MESSAGE exchange (ciphertext only) so a sibling can store or
+// further relay it. already_stored counts as success: the sibling network
+// already carries this ID and loops are avoided by message-ID idempotency.
+func forwardHoldMessage(
+	sibling string,
+	local *identity.Identity,
+	db *database.Database,
+	envelope message.EncryptedMessage,
+) error {
+	return SendHoldMessage(sibling, local, db, &envelope)
 }
 
 // FetchHeldMessages collects encrypted envelopes held for this identity,
@@ -1172,7 +1197,10 @@ func deliverEnvelopeToAddress(
 //
 // Daddy runs this after answering HOLD_ACK. The ciphertext is forwarded
 // unchanged (SPEC section 27), so Daddy never needs to decrypt anything. If
-// the relay cannot be completed the envelope simply stays held.
+// the recipient is registered locally it is dialled directly; otherwise the
+// envelope is forwarded to a sibling Daddy that may know the recipient
+// (SPEC v0.5 section 20). If nothing can be completed the envelope simply
+// stays held.
 func relayHeldMessage(
 	local *identity.Identity,
 	db *database.Database,
@@ -1185,26 +1213,30 @@ func relayHeldMessage(
 		return
 	}
 
-	route, err := db.GetRoute(
+	if route, err := db.GetRoute(
 		envelope.RecipientNamespace,
 		recipientKey,
-	)
-	if err != nil {
-		return
+	); err == nil {
+		if err := deliverEnvelopeToAddress(
+			local,
+			db,
+			route.Address,
+			recipientKey,
+			envelope,
+		); err == nil {
+			_ = db.DeleteHeldMessage(envelope.ID)
+
+			return
+		}
+
+		_ = db.DeleteRoute(
+			envelope.RecipientNamespace,
+			recipientKey,
+			route.Address,
+		)
 	}
 
-	if err := deliverEnvelopeToAddress(
-		local,
-		db,
-		route.Address,
-		recipientKey,
-		envelope,
-	); err != nil {
-		return
-	}
-
-	// The recipient confirmed delivery. Daddy deletes its copy.
-	_ = db.DeleteHeldMessage(envelope.ID)
+	forwardHeldToSiblingDaddies(local, db, envelope)
 }
 
 // resolveRecipient returns the recipient's encryption key and the freshest
@@ -1247,13 +1279,7 @@ type SendResult struct {
 	Address string
 }
 
-// ResolveAndSend performs the complete ghost send flow (SPEC section 11):
-//
-//	resolve identity -> find route -> dial -> handshake -> encrypt ->
-//	send -> ack -> close
-//
-// No user-managed connection is involved and the socket is closed before this
-// function returns.
+// ResolveAndSend performs the complete ghost send flow.
 func ResolveAndSend(
 	local *identity.Identity,
 	db *database.Database,
@@ -1261,33 +1287,27 @@ func ResolveAndSend(
 	recipientPublicKey []byte,
 	msg *message.Message,
 ) (*SendResult, error) {
-	daddy := daddyAddressFromDB(db)
-
+	daddies := DaddyAddresses(db, DefaultRelaysPath())
 	encryptionKey, directAddress := resolveRecipient(
 		db,
 		recipientNamespace,
 		recipientPublicKey,
 	)
-
-	// No usable direct route: ask Daddy to resolve the identity.
-	if directAddress == "" && daddy != "" {
-		route, err := LookupRouteWithDaddy(
-			daddy,
+	if directAddress == "" {
+		route, key := lookupViaRelays(
 			local,
 			db,
+			daddies,
 			recipientNamespace,
 			recipientPublicKey,
 		)
-		if err == nil && route != nil {
+		if route != nil {
 			directAddress = route.Address
-
-			if len(encryptionKey) == 0 &&
-				len(route.EncryptionKey) > 0 {
-				encryptionKey = route.EncryptionKey
-			}
+		}
+		if len(encryptionKey) == 0 {
+			encryptionKey = key
 		}
 	}
-
 	if len(encryptionKey) == 0 {
 		return nil, fmt.Errorf(
 			"no encryption key known for %s::%s",
@@ -1297,7 +1317,6 @@ func ResolveAndSend(
 			),
 		)
 	}
-
 	envelope, err := msg.EncryptForRecipient(
 		encryptionKey,
 		recipientNamespace,
@@ -1306,9 +1325,6 @@ func ResolveAndSend(
 	if err != nil {
 		return nil, fmt.Errorf("encrypt message: %w", err)
 	}
-
-	// Direct delivery: this also hides nothing about addresses, which is
-	// acceptable because direct delivery is the fastest path (SPEC section 29).
 	if directAddress != "" {
 		if err := deliverEnvelopeToAddress(
 			local,
@@ -1322,27 +1338,16 @@ func ResolveAndSend(
 				Address:   directAddress,
 			}, nil
 		}
-
-		// The cached route was stale. Drop it and fall back to Daddy.
-		_ = db.DeleteAllRoutesForPeer(
+		_ = db.DeleteRoute(
 			recipientNamespace,
 			recipientPublicKey,
+			directAddress,
 		)
+		_ = db.DeleteExpiredRoutes()
 	}
-
-	// Recipient is not directly reachable: hand the ciphertext to Daddy,
-	// which can relay it now or hold it for up to 30 days.
-	if daddy != "" {
-		if err := SendHoldMessage(
-			daddy,
-			local,
-			db,
-			envelope,
-		); err == nil {
-			return &SendResult{Relayed: true}, nil
-		}
+	if holdViaRelays(local, db, daddies, envelope) {
+		return &SendResult{Relayed: true}, nil
 	}
-
 	return nil, errors.New(
 		"unable to deliver message: recipient is unreachable and Daddy is unavailable",
 	)
@@ -1382,45 +1387,75 @@ func StartCleanupRoutine(db *database.Database) func() {
 // ghost connection, refreshes this node's route, collects any held messages
 // and leaves. If Daddy is unreachable the loop keeps retrying and the node
 // continues to work by direct delivery alone (SPEC section 7).
+//
+// Every configured relay is refreshed in turn, so disabling one Daddy does
+// not strand the node (SPEC v0.5 section 19, Test F).
 func DialPersistent(
 	daddyAddress string,
 	local *identity.Identity,
 	db *database.Database,
 ) {
-	if strings.TrimSpace(daddyAddress) == "" {
+	daddies := DaddyAddresses(db, DefaultRelaysPath())
+
+	if strings.TrimSpace(daddyAddress) != "" {
+		seen := false
+
+		for _, existing := range daddies {
+			if existing == strings.TrimSpace(daddyAddress) {
+				seen = true
+
+				break
+			}
+		}
+
+		if !seen {
+			daddies = append(
+				[]string{strings.TrimSpace(daddyAddress)},
+				daddies...,
+			)
+		}
+	}
+
+	if len(daddies) == 0 {
 		return
 	}
 
-	if err := SetDaddyAddress(db, daddyAddress); err != nil {
-		fmt.Printf("Daddy: cannot store address: %v\n", err)
+	for _, daddy := range daddies {
+		if err := SetDaddyAddress(db, daddy); err != nil {
+			fmt.Printf("Daddy: cannot store address: %v\n", err)
+		}
 	}
 
 	stopCleanup := StartCleanupRoutine(db)
 	defer stopCleanup()
 
 	refresh := func() {
-		if err := RegisterRouteWithDaddy(
-			daddyAddress,
-			local,
-			db,
-		); err != nil {
-			fmt.Printf(
-				"Daddy: route registration failed: %v\n",
-				err,
-			)
+		for _, daddy := range daddies {
+			if err := RegisterRouteWithDaddy(
+				daddy,
+				local,
+				db,
+			); err != nil {
+				fmt.Printf(
+					"Daddy %s: route registration failed: %v\n",
+					daddy,
+					err,
+				)
 
-			return
-		}
+				continue
+			}
 
-		if err := collectHeldMessages(
-			daddyAddress,
-			local,
-			db,
-		); err != nil {
-			fmt.Printf(
-				"Daddy: collecting held messages failed: %v\n",
-				err,
-			)
+			if err := collectHeldMessages(
+				daddy,
+				local,
+				db,
+			); err != nil {
+				fmt.Printf(
+					"Daddy %s: collecting held messages failed: %v\n",
+					daddy,
+					err,
+				)
+			}
 		}
 	}
 
@@ -1437,16 +1472,36 @@ func DialPersistent(
 
 // collectHeldMessages fetches and acknowledges any envelopes Daddy is holding
 // for this identity (SPEC section 23).
+//
+// Every configured relay is tried in order; one dead Daddy never blocks
+// collection from the others (SPEC v0.5 section 19, Test F).
 func collectHeldMessages(
 	daddyAddress string,
 	local *identity.Identity,
 	db *database.Database,
 ) error {
-	delivered, err := FetchHeldMessages(
-		daddyAddress,
-		local,
-		db,
-	)
+	daddies := DaddyAddresses(db, DefaultRelaysPath())
+
+	if strings.TrimSpace(daddyAddress) != "" {
+		seen := false
+
+		for _, existing := range daddies {
+			if existing == strings.TrimSpace(daddyAddress) {
+				seen = true
+
+				break
+			}
+		}
+
+		if !seen {
+			daddies = append(
+				[]string{strings.TrimSpace(daddyAddress)},
+				daddies...,
+			)
+		}
+	}
+
+	delivered, err := fetchViaRelays(daddies, local, db)
 	if err != nil {
 		return err
 	}

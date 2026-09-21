@@ -22,6 +22,42 @@ type StoredMessage struct {
 	StoredAt  int64
 }
 
+// Canonical message directions (SPEC v0.5 sections 4, 5, 13, 14).
+//
+//   - DirectionSent: the message left this device and InkMail has accepted
+//     responsibility for delivering it (direct ACK or HOLD_ACK).
+//   - DirectionQueued: the message exists locally but has not yet been
+//     transferred to any relay or destination. It must be retried.
+//   - DirectionReceived: an envelope addressed to this device was
+//     authenticated, decrypted and committed to the local store.
+//
+// The legacy "in" direction (pre-v0.5 inbound label) is migrated to
+// "received" on open, and "out" is migrated to "sent". The two must never
+// coexist as user-facing types.
+const (
+	DirectionSent     = "sent"
+	DirectionQueued   = "queued"
+	DirectionReceived = "received"
+)
+
+// Legacy directions rewritten by the migration below.
+const (
+	legacyDirectionIn  = "in"
+	legacyDirectionOut = "out"
+)
+
+// Unknown values are returned unchanged so future states keep working.
+func NormaliseDirection(direction string) string {
+	switch direction {
+	case legacyDirectionIn:
+		return DirectionReceived
+	case legacyDirectionOut:
+		return DirectionSent
+	default:
+		return direction
+	}
+}
+
 func Open(path string) (*Database, error) {
 	db, err := sql.Open("sqlite", path)
 	if err != nil {
@@ -154,6 +190,30 @@ func (d *Database) migrate() error {
 				err,
 			)
 		}
+	}
+
+	// SPEC v0.5 section 13: the user-visible "in" direction becomes
+	// "received"; the legacy "out" direction becomes "sent".
+	if _, err := d.DB.Exec(
+		`UPDATE messages SET direction = ? WHERE direction = ?`,
+		DirectionReceived,
+		legacyDirectionIn,
+	); err != nil {
+		return fmt.Errorf(
+			"migrate message directions: %w",
+			err,
+		)
+	}
+
+	if _, err := d.DB.Exec(
+		`UPDATE messages SET direction = ? WHERE direction = ?`,
+		DirectionSent,
+		legacyDirectionOut,
+	); err != nil {
+		return fmt.Errorf(
+			"migrate message directions: %w",
+			err,
+		)
 	}
 
 	return nil
@@ -379,6 +439,10 @@ type PeerIdentity struct {
 	LastSeen            int64
 }
 
+// StoreMessage persists a message idempotently. A repeated delivery of an
+// already-stored ID keeps the original direction and only refreshes the
+// status, so duplicate delivery can never create a second user-visible copy
+// (SPEC v0.5 Test H).
 func (d *Database) StoreMessage(
 	msg *message.Message,
 	direction string,
@@ -1027,6 +1091,116 @@ func (d *Database) DeleteExpiredRoutes() error {
 	if err != nil {
 		return fmt.Errorf(
 			"delete expired routes: %w",
+			err,
+		)
+	}
+
+	return nil
+}
+
+// RegisterOrReplaceRoute records a route for a peer while superseding every
+// stale route the peer previously advertised (SPEC v0.5 section 28, Test I).
+//
+// A new registration at route B replaces route A instead of accumulating
+// alongside it. Both client and Daddy caches call this after a registration
+// or a successful lookup, so the active set only ever holds the freshest
+// known address.
+func (d *Database) RegisterOrReplaceRoute(
+	namespace string,
+	publicKey []byte,
+	address string,
+	expiresAt int64,
+) error {
+	now := time.Now().Unix()
+
+	tx, err := d.DB.Begin()
+	if err != nil {
+		return fmt.Errorf(
+			"begin route registration: %w",
+			err,
+		)
+	}
+
+	committed := false
+
+	defer func() {
+		if !committed {
+			_ = tx.Rollback()
+		}
+	}()
+
+	if _, err := tx.Exec(
+		`DELETE FROM peer_routes
+		 WHERE namespace = ?
+		   AND public_key = ?
+		   AND address != ?`,
+		namespace,
+		publicKey,
+		address,
+	); err != nil {
+		return fmt.Errorf(
+			"supersede stale peer routes: %w",
+			err,
+		)
+	}
+
+	if _, err := tx.Exec(
+		`INSERT INTO peer_routes(
+			namespace,
+			public_key,
+			address,
+			expires_at,
+			last_seen
+		)
+		VALUES (?, ?, ?, ?, ?)
+		ON CONFLICT(namespace, public_key, address)
+		DO UPDATE SET
+			expires_at = excluded.expires_at,
+			last_seen = excluded.last_seen`,
+		namespace,
+		publicKey,
+		address,
+		expiresAt,
+		now,
+	); err != nil {
+		return fmt.Errorf(
+			"store peer route: %w",
+			err,
+		)
+	}
+
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf(
+			"commit route registration: %w",
+			err,
+		)
+	}
+
+	committed = true
+
+	return nil
+}
+
+// DeleteRoute removes one specific route. It is used to drop a route that
+// has just proven unreachable, so the next send does not retry the same
+// dead address (SPEC v0.5 section 17).
+func (d *Database) DeleteRoute(
+	namespace string,
+	publicKey []byte,
+	address string,
+) error {
+	_, err := d.DB.Exec(
+		`DELETE FROM peer_routes
+		 WHERE namespace = ?
+		   AND public_key = ?
+		   AND address = ?`,
+		namespace,
+		publicKey,
+		address,
+	)
+	if err != nil {
+		return fmt.Errorf(
+			"delete peer route: %w",
 			err,
 		)
 	}

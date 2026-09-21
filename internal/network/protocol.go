@@ -18,6 +18,8 @@ import (
 	"crypto/ed25519"
 	"encoding/json"
 	"net"
+	"os"
+	"strings"
 	"time"
 
 	"github.com/SQU1DMAN6/inkmail/internal/identity"
@@ -52,15 +54,47 @@ const (
 	// HeldMessageTTL is the maximum lifetime of a held message in seconds
 	// (30 days, SPEC section 22).
 	HeldMessageTTL = 30 * 24 * 60 * 60
+)
 
-	// dialTimeout bounds a single ghost connection attempt.
-	dialTimeout = 10 * time.Second
+var (
+	// DefaultDialTimeout bounds a single ghost connection attempt (SPEC v0.5
+	// section 16). 3s keeps an unreachable direct route from stalling the
+	// user's send operation. Override with INKMAIL_DIAL_TIMEOUT (e.g. "5s").
+	DefaultDialTimeout = 3 * time.Second
 
-	// sessionTimeout bounds a whole temporary session.
-	sessionTimeout = 30 * time.Second
+	// DefaultSessionTimeout bounds a whole temporary ghost session
+	// (handshake + one exchange + ack). 10s is enough for a healthy peer or
+	// Daddy while still failing fast.
+	DefaultSessionTimeout = 10 * time.Second
+)
 
-	// handshakeTimeout bounds the handshake phase only.
-	// handshakeTimeout = 15 * time.Second
+// effectiveDialTimeout returns the per-attempt timeout, honouring
+// INKMAIL_DIAL_TIMEOUT when set to a valid duration.
+func effectiveDialTimeout() time.Duration {
+	if raw := strings.TrimSpace(os.Getenv("INKMAIL_DIAL_TIMEOUT")); raw != "" {
+		if parsed, err := time.ParseDuration(raw); err == nil && parsed > 0 &&
+			parsed <= time.Minute {
+			return parsed
+		}
+	}
+
+	return DefaultDialTimeout
+}
+
+// effectiveSessionTimeout returns the whole-session deadline, honouring
+// INKMAIL_SESSION_TIMEOUT when set to a valid duration.
+func effectiveSessionTimeout() time.Duration {
+	if raw := strings.TrimSpace(os.Getenv("INKMAIL_SESSION_TIMEOUT")); raw != "" {
+		if parsed, err := time.ParseDuration(raw); err == nil && parsed > 0 &&
+			parsed <= 5*time.Minute {
+			return parsed
+		}
+	}
+
+	return DefaultSessionTimeout
+}
+
+const (
 
 	// maxClockSkew bounds how far a handshake timestamp may deviate.
 	maxClockSkew = 15 * time.Minute

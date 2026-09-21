@@ -53,7 +53,7 @@ func acceptSession(
 	db *database.Database,
 ) (*Session, error) {
 	if err := conn.SetDeadline(
-		time.Now().Add(sessionTimeout),
+		time.Now().Add(effectiveSessionTimeout()),
 	); err != nil {
 		_ = conn.Close()
 
@@ -111,7 +111,7 @@ func serveSession(
 
 		if session.Conn != nil {
 			if err := session.Conn.SetDeadline(
-				time.Now().Add(sessionTimeout),
+				time.Now().Add(effectiveSessionTimeout()),
 			); err != nil {
 				return err
 			}
@@ -287,7 +287,7 @@ func receiveEncryptedEnvelope(
 		Signature:          envelope.Signature,
 	}
 
-	if err := db.StoreMessage(stored, "in", statusDelivered); err != nil {
+	if err := db.StoreMessage(stored, database.DirectionReceived, statusDelivered); err != nil {
 		return err
 	}
 

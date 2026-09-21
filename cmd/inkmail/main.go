@@ -160,16 +160,11 @@ func (c *Client) handleCommand(
 	case "peers":
 		c.printPeers()
 
-	case "list":
-		if len(parts) != 2 ||
-			parts[1] != "messages" {
-			fmt.Println(
-				"Usage: list messages",
-			)
-			return false
-		}
-
+	case "msg":
 		c.listMessages()
+
+	case "relays":
+		c.printRelays()
 
 	case "open":
 		if len(parts) != 2 {
@@ -202,9 +197,8 @@ func (c *Client) printHelp() {
 	fmt.Println("Commands:")
 	fmt.Println("  identity                 Show local identity")
 	fmt.Println("  peers                    Show known peer identities")
-	fmt.Println("  connect <host>:<port>    Connect to a peer")
-	fmt.Println("  disconnect               Close current peer connection")
-	fmt.Println("  list messages            List stored messages")
+	fmt.Println("  relays                   Show configured Daddy relays")
+	fmt.Println("  msg                      List stored messages")
 	fmt.Println("  open <message ID>        Open a stored message")
 	fmt.Println("  send                     Send a message")
 	fmt.Println("  help                     Show this help")
@@ -260,7 +254,7 @@ func (c *Client) listMessages() {
 	messages, err := c.Database.ListMessages()
 	if err != nil {
 		fmt.Printf(
-			"list messages: %v\n",
+			"msg: %v\n",
 			err,
 		)
 		return
@@ -283,6 +277,8 @@ func (c *Client) listMessages() {
 	)
 
 	for _, stored := range messages {
+		direction := database.NormaliseDirection(stored.Direction)
+
 		from := fmt.Sprintf(
 			"%s::%s",
 			stored.Message.SenderNamespace,
@@ -290,8 +286,6 @@ func (c *Client) listMessages() {
 				stored.Message.SenderPublicKey,
 			),
 		)
-
-		direction := stored.Direction
 
 		fmt.Printf(
 			"%-64s  %-8s  %-24s  %s\n",
@@ -355,6 +349,28 @@ func (c *Client) openMessage(
 	)
 	fmt.Println()
 	fmt.Println(msg.Body)
+	fmt.Println()
+}
+
+func (c *Client) printRelays() {
+	addresses := network.DaddyAddresses(c.Database, "")
+
+	fmt.Println()
+	fmt.Println("Configured relays (dial order):")
+	fmt.Println()
+
+	for i, address := range addresses {
+		fmt.Printf(
+			"%d. %s\n",
+			i+1,
+			address,
+		)
+	}
+
+	fmt.Println()
+	fmt.Printf("%d relay(s)\n", len(addresses))
+	fmt.Println()
+	fmt.Println("Edit relays.conf in the data directory to change priority.")
 	fmt.Println()
 }
 
@@ -526,12 +542,11 @@ func (c *Client) sendInteractive(
 }
 
 // sendMessageToPeer implements ghost networking:
-// 1. Find route to peer
-// 2. Dial peer (or Daddy if no direct route)
-// 3. Handshake (authenticate and exchange encryption keys)
-// 4. Send encrypted message
-// 5. Wait for ACK
-// 6. Close connection
+// 1. Persist the message locally as queued (visible in `msg` immediately).
+// 2. Find route to peer.
+// 3. Dial peer directly or hand the envelope to Daddy.
+// 4. Promote the local copy to sent once InkMail accepts responsibility.
+// 5. Close every connection as soon as the exchange completes.
 func (c *Client) sendMessageToPeer(
 	recipientNamespace string,
 	recipientPublicKey []byte,
@@ -553,9 +568,23 @@ func (c *Client) sendMessageToPeer(
 	fmt.Printf("Message ID: %s\n", msg.ID)
 	fmt.Println()
 
-	// Attempt to send via ghost connection
-	// This will try direct connection first, then Daddy if needed
-	addr, err := network.ResolveAndSend(
+	// Persist the message locally BEFORE any network activity so the sender
+	// always sees it in `msg`, even if every route is dead (SPEC v0.5
+	// sections 4, 7, Test A).
+	if err := c.Database.StoreMessage(
+		msg,
+		database.DirectionQueued,
+		"queued",
+	); err != nil {
+		return fmt.Errorf("store local message: %w", err)
+	}
+
+	fmt.Println("Message queued.")
+	fmt.Println()
+
+	// Attempt to send via ghost connection.
+	// This will try direct connection first, then Daddy if needed.
+	result, err := network.ResolveAndSend(
 		c.Identity,
 		c.Database,
 		recipientNamespace,
@@ -563,13 +592,42 @@ func (c *Client) sendMessageToPeer(
 		msg,
 	)
 	if err != nil {
+		fmt.Println("Message queued for retry.")
+		fmt.Println("Recipient has not yet confirmed receipt.")
+		fmt.Println()
 		return fmt.Errorf("send message: %w", err)
 	}
 
-	if addr != nil {
-		fmt.Printf("Delivered via: %s\n", addr.Address)
+	// InkMail has accepted responsibility: either the recipient ACKed the
+	// envelope directly or Daddy replied HOLD_ACK. Either way the message is
+	// `sent` from the sender's perspective. It is NOT `received` until the
+	// destination stores it and returns DELIVERY_ACK (SPEC v0.5 sections 5,
+	// 8, 11).
+	//
+	// A single StoreMessage promotion flips both direction and status, so the
+	// row never lingers as direction=queued/status=sent.
+	if err := c.Database.StoreMessage(
+		msg,
+		database.DirectionSent,
+		"sent",
+	); err != nil {
+		return fmt.Errorf("mark message sent: %w", err)
+	}
+
+	if result != nil && result.Delivered {
+		fmt.Println("Message delivered and acknowledged.")
+	} else if result != nil && result.Relayed {
+		fmt.Println("Message sent to Daddy and queued for delivery.")
+		fmt.Println("Status: queued")
 	} else {
-		fmt.Println("Message held for delivery (recipient offline).")
+		fmt.Println("Message accepted for delivery.")
+	}
+
+	fmt.Println("Recipient has not yet confirmed receipt.")
+	fmt.Println()
+
+	if result != nil && result.Address != "" {
+		fmt.Printf("Delivered via: %s\n", result.Address)
 	}
 
 	return nil

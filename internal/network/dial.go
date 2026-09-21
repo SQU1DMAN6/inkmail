@@ -38,6 +38,15 @@ type PeerStore interface {
 		address string,
 		expiresAt int64,
 	) error
+
+	// RegisterOrReplaceRoute supersedes stale routes so a fresh registration
+	// at route B replaces route A (SPEC v0.5 section 28, Test I).
+	RegisterOrReplaceRoute(
+		namespace string,
+		publicKey []byte,
+		address string,
+		expiresAt int64,
+	) error
 }
 
 // remoteAddress returns the peer address of an outbound session, if any.
@@ -192,6 +201,10 @@ func negotiateAsResponder(
 
 // recordPeer remembers an authenticated peer identity and, when the peer's
 // transport address is known, a short-lived direct route (SPEC section 15).
+//
+// The route registration supersedes stale addresses so a fresh route B
+// replaces a dead route A instead of accumulating beside it (SPEC v0.5
+// sections 17, 28, Test I).
 func recordPeer(
 	db PeerStore,
 	session *Session,
@@ -208,6 +221,19 @@ func recordPeer(
 	)
 
 	if address == "" {
+		return
+	}
+
+	if registrar, ok := db.(interface {
+		RegisterOrReplaceRoute(string, []byte, string, int64) error
+	}); ok {
+		_ = registrar.RegisterOrReplaceRoute(
+			session.PeerNamespace,
+			[]byte(session.Peer),
+			address,
+			time.Now().Add(DefaultRouteTTL).Unix(),
+		)
+
 		return
 	}
 
@@ -238,6 +264,9 @@ func recordInboundPeer(
 //
 // The caller must Close the returned session as soon as the exchange is
 // complete; session keys are destroyed on Close (SPEC section 33).
+//
+// The dial and the whole session are bounded (SPEC v0.5 section 16): a dead
+// route fails in ~3s instead of stalling the send for a minute.
 func Dial(
 	address string,
 	local *identity.Identity,
@@ -246,7 +275,7 @@ func Dial(
 	conn, err := net.DialTimeout(
 		"tcp",
 		address,
-		dialTimeout,
+		effectiveDialTimeout(),
 	)
 	if err != nil {
 		return nil, fmt.Errorf(
@@ -257,7 +286,7 @@ func Dial(
 	}
 
 	if err := conn.SetDeadline(
-		time.Now().Add(sessionTimeout),
+		time.Now().Add(effectiveSessionTimeout()),
 	); err != nil {
 		_ = conn.Close()
 

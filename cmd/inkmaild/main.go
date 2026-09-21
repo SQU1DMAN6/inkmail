@@ -40,7 +40,13 @@ func main() {
 	daddy := flag.String(
 		"daddy",
 		defaultDaddy,
-		"address of the Daddy fallback node; use an empty value to disable it",
+		"address of the Daddy fallback node; use an empty value to disable it (relays.conf is tried first)",
+	)
+
+	relaysPath := flag.String(
+		"relays",
+		"",
+		"path to relays.conf (defaults to <data>/relays.conf)",
 	)
 
 	flag.Parse()
@@ -99,7 +105,17 @@ func main() {
 
 	defer db.DB.Close()
 
-	if *daddy == "" {
+	relaysFile := *relaysPath
+
+	if relaysFile == "" {
+		relaysFile = filepath.Join(*dataDir, network.RelaysFileName)
+	}
+
+	for _, relay := range network.DaddyAddresses(db, relaysFile) {
+		fmt.Printf("Relay: %s\n", relay)
+	}
+
+	if *daddy == "" && len(network.DaddyAddresses(db, relaysFile)) == 0 {
 		fmt.Println(
 			"Daddy: disabled",
 		)
@@ -124,13 +140,11 @@ func main() {
 		}
 	}()
 
-	if *daddy != "" {
-		go network.DialPersistent(
-			*daddy,
-			id,
-			db,
-		)
-	}
+	go network.DialPersistent(
+		*daddy,
+		id,
+		db,
+	)
 
 	signals := make(chan os.Signal, 1)
 
