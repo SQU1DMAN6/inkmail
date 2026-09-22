@@ -258,10 +258,6 @@ func (c *Client) closeSession() {
 	)
 }
 
-func (c *Client) listMessages() {
-	c.listMessagesIn("inbox")
-}
-
 func (c *Client) listMessagesIn(folder string) {
 	name := strings.ToLower(strings.TrimSpace(folder))
 	if name == "" {
