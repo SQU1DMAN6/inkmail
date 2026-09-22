@@ -1456,6 +1456,8 @@ func DialPersistent(
 					err,
 				)
 			}
+
+			syncMailboxFromDaddyQuiet(daddy, local, db)
 		}
 	}
 

@@ -11,6 +11,36 @@ import (
 	"github.com/SQU1DMAN6/inkmail/internal/message"
 )
 
+// MailboxOpKind enumerates the signed mailbox mutations a device may issue
+// for one of its own messages. Ops are replicated to Daddy so every device
+// converges, but only the message owner may author them.
+const (
+	MailboxOpMove   = "move"
+	MailboxOpDelete = "delete"
+)
+
+// Reserved mailbox folders. "inbox" is the default view; "archive" and
+// "important" are the built-in user folders. Custom folder names are allowed
+// but validated by NormaliseFolder.
+const (
+	FolderInbox     = "inbox"
+	FolderArchive   = "archive"
+	FolderImportant = "important"
+	FolderDeleted   = "deleted"
+)
+
+// MailboxOp is one signed move/delete mutation for a single message.
+type MailboxOp struct {
+	MessageID   string
+	Op          string
+	Folder      string
+	AuthorNS    string
+	AuthorKey   []byte
+	Timestamp   int64
+	Signature   []byte
+	SubmittedAt int64
+}
+
 type Database struct {
 	DB *sql.DB
 }
@@ -129,8 +159,26 @@ func (d *Database) init() error {
 		signature BLOB NOT NULL,
 		direction TEXT NOT NULL,
 		status TEXT NOT NULL,
+		folder TEXT NOT NULL DEFAULT 'inbox',
+		folder_updated_at INTEGER NOT NULL DEFAULT 0,
 		stored_at INTEGER NOT NULL
 	);
+
+	CREATE TABLE IF NOT EXISTS mailbox_ops (
+		message_id TEXT NOT NULL,
+		op TEXT NOT NULL,
+		folder TEXT NOT NULL DEFAULT '',
+		author_namespace TEXT NOT NULL,
+		author_public_key BLOB NOT NULL,
+		timestamp INTEGER NOT NULL,
+		signature BLOB NOT NULL,
+		submitted_at INTEGER NOT NULL,
+		PRIMARY KEY(message_id, op, timestamp, author_public_key)
+	);
+
+	CREATE INDEX IF NOT EXISTS
+		idx_mailbox_ops_message
+	ON mailbox_ops(message_id);
 
 	CREATE INDEX IF NOT EXISTS
 		idx_messages_created_at
@@ -177,6 +225,10 @@ func (d *Database) migrate() error {
 	migrations := []string{
 		`ALTER TABLE peer_identities
 		 ADD COLUMN encryption_public_key BLOB`,
+		`ALTER TABLE messages
+		 ADD COLUMN folder TEXT NOT NULL DEFAULT 'inbox'`,
+		`ALTER TABLE messages
+		 ADD COLUMN folder_updated_at INTEGER NOT NULL DEFAULT 0`,
 	}
 
 	for _, statement := range migrations {
@@ -491,9 +543,11 @@ func (d *Database) StoreMessage(
 			signature,
 			direction,
 			status,
+			folder,
+			folder_updated_at,
 			stored_at
 		)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT(id)
 		DO UPDATE SET
 			status = excluded.status
@@ -509,6 +563,8 @@ func (d *Database) StoreMessage(
 		signature,
 		direction,
 		status,
+		FolderInbox,
+		now,
 		now,
 	)
 
@@ -520,6 +576,219 @@ func (d *Database) StoreMessage(
 	}
 
 	return nil
+}
+
+// NormaliseFolder lowercases, trims and validates a mailbox folder name.
+// Empty means the default inbox view. Reserved names inbox/archive/important/
+// deleted are always accepted; custom names must be 1-64 chars of
+// letters/digits/dash/underscore/dot.
+func NormaliseFolder(folder string) (string, error) {
+	name := strings.ToLower(strings.TrimSpace(folder))
+	if name == "" {
+		return FolderInbox, nil
+	}
+	switch name {
+	case FolderInbox, FolderArchive, FolderImportant, FolderDeleted:
+		return name, nil
+	}
+	if len(name) > 64 {
+		return "", fmt.Errorf("folder name too long")
+	}
+	for _, r := range name {
+		ok := r >= 'a' && r <= 'z' || r >= '0' && r <= '9' ||
+			r == '-' || r == '_' || r == '.'
+		if !ok {
+			return "", fmt.Errorf("invalid folder name %q", folder)
+		}
+	}
+	return name, nil
+}
+
+// ListMessagesInFolder returns stored messages filtered by folder.
+// Empty folder selects the default inbox view; "all" returns everything.
+func (d *Database) ListMessagesInFolder(folder string) ([]StoredMessage, error) {
+	name := strings.ToLower(strings.TrimSpace(folder))
+	if name == "" {
+		name = FolderInbox
+	}
+	var rows *sql.Rows
+	var err error
+	if name == "all" {
+		rows, err = d.DB.Query(`
+			SELECT
+				id,
+				sender_namespace,
+				sender_public_key,
+				recipient_namespace,
+				recipient_public_key,
+				subject,
+				body,
+				created_at,
+				signature,
+				direction,
+				status,
+				folder,
+				folder_updated_at,
+				stored_at
+			FROM messages
+			ORDER BY stored_at DESC
+		`)
+	} else {
+		rows, err = d.DB.Query(`
+			SELECT
+				id,
+				sender_namespace,
+				sender_public_key,
+				recipient_namespace,
+				recipient_public_key,
+				subject,
+				body,
+				created_at,
+				signature,
+				direction,
+				status,
+				folder,
+				folder_updated_at,
+				stored_at
+			FROM messages
+			WHERE folder = ?
+			ORDER BY stored_at DESC
+		`, name)
+	}
+	if err != nil {
+		return nil, fmt.Errorf("list messages: %w", err)
+	}
+	defer rows.Close()
+	var out []StoredMessage
+	for rows.Next() {
+		var stored StoredMessage
+		var signature []byte
+		var senderKey, recipientKey []byte
+		var folder string
+		var folderUpdated int64
+		if err := rows.Scan(
+			&stored.Message.ID,
+			&stored.Message.SenderNamespace,
+			&senderKey,
+			&stored.Message.RecipientNamespace,
+			&recipientKey,
+			&stored.Message.Subject,
+			&stored.Message.Body,
+			&stored.Message.CreatedAt,
+			&signature,
+			&stored.Direction,
+			&stored.Status,
+			&folder,
+			&folderUpdated,
+			&stored.StoredAt,
+		); err != nil {
+			return nil, fmt.Errorf("scan message row: %w", err)
+		}
+		stored.Message.SenderPublicKey = encodeHex(senderKey)
+		stored.Message.RecipientPublicKey = encodeHex(recipientKey)
+		stored.Message.Signature = encodeHex(signature)
+		stored.Direction = NormaliseDirection(stored.Direction)
+		_ = folder
+		_ = folderUpdated
+		out = append(out, stored)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate messages: %w", err)
+	}
+	return out, nil
+}
+
+// ApplyMailboxOp records a signed op and applies last-writer-wins folder
+// state for the message when the op timestamp is newer than current state.
+// Unknown message IDs are still journalled so late-arriving envelopes
+// converge when they appear. Returns true when local folder state changed.
+func (d *Database) ApplyMailboxOp(op MailboxOp) (bool, error) {
+	if strings.TrimSpace(op.MessageID) == "" {
+		return false, fmt.Errorf("mailbox op has no message id")
+	}
+	if op.Op != MailboxOpMove && op.Op != MailboxOpDelete {
+		return false, fmt.Errorf("unknown mailbox op %q", op.Op)
+	}
+	folder := FolderDeleted
+	if op.Op == MailboxOpMove {
+		normalised, err := NormaliseFolder(op.Folder)
+		if err != nil {
+			return false, err
+		}
+		folder = normalised
+	}
+	now := time.Now().Unix()
+	if _, err := d.DB.Exec(`
+		INSERT INTO mailbox_ops(
+			message_id, op, folder,
+			author_namespace, author_public_key,
+			timestamp, signature, submitted_at
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+		ON CONFLICT(message_id, op, timestamp, author_public_key)
+		DO NOTHING
+	`, op.MessageID, op.Op, folder, op.AuthorNS, op.AuthorKey,
+		op.Timestamp, op.Signature, now); err != nil {
+		return false, fmt.Errorf("record mailbox op: %w", err)
+	}
+	res, err := d.DB.Exec(`
+		UPDATE messages SET folder = ?, folder_updated_at = ?
+		WHERE id = ? AND folder_updated_at < ?
+	`, folder, op.Timestamp, op.MessageID, op.Timestamp)
+	if err != nil {
+		return false, fmt.Errorf("apply mailbox op: %w", err)
+	}
+	affected, err := res.RowsAffected()
+	if err != nil {
+		return false, fmt.Errorf("mailbox op rows: %w", err)
+	}
+	return affected > 0, nil
+}
+
+// ListMailboxOpsSince returns ops journalled after the given rowid watermark.
+func (d *Database) ListMailboxOpsSince(since int64, limit int) ([]MailboxOp, int64, error) {
+	if limit <= 0 || limit > 500 {
+		limit = 200
+	}
+	rows, err := d.DB.Query(`
+		SELECT rowid, message_id, op, folder,
+			author_namespace, author_public_key,
+			timestamp, signature, submitted_at
+		FROM mailbox_ops
+		WHERE rowid > ?
+		ORDER BY rowid ASC
+		LIMIT ?
+	`, since, limit)
+	if err != nil {
+		return nil, since, fmt.Errorf("list mailbox ops: %w", err)
+	}
+	defer rows.Close()
+	var ops []MailboxOp
+	watermark := since
+	for rows.Next() {
+		var op MailboxOp
+		var rowid int64
+		if err := rows.Scan(&rowid, &op.MessageID, &op.Op, &op.Folder,
+			&op.AuthorNS, &op.AuthorKey, &op.Timestamp, &op.Signature,
+			&op.SubmittedAt); err != nil {
+			return nil, since, fmt.Errorf("scan mailbox op: %w", err)
+		}
+		ops = append(ops, op)
+		watermark = rowid
+	}
+	if err := rows.Err(); err != nil {
+		return nil, since, fmt.Errorf("iterate mailbox ops: %w", err)
+	}
+	return ops, watermark, nil
+}
+
+// GetMessageFolder returns the current folder of a stored message.
+func (d *Database) GetMessageFolder(id string) (string, error) {
+	var folder string
+	err := d.DB.QueryRow(`SELECT folder FROM messages WHERE id = ?`, id).Scan(&folder)
+	if err != nil {
+		return "", err
+	}
+	return folder, nil
 }
 
 func (d *Database) UpdateMessageStatus(

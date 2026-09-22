@@ -161,10 +161,14 @@ func (c *Client) handleCommand(
 		c.printPeers()
 
 	case "msg":
-		c.listMessages()
+		c.handleMsgCommand(parts[1:])
 
 	case "relays":
-		c.printRelays()
+		if len(parts) > 1 && parts[1] == "probe" {
+			c.probeRelays()
+		} else {
+			c.printRelays()
+		}
 
 	case "open":
 		if len(parts) != 2 {
@@ -198,7 +202,11 @@ func (c *Client) printHelp() {
 	fmt.Println("  identity                 Show local identity")
 	fmt.Println("  peers                    Show known peer identities")
 	fmt.Println("  relays                   Show configured Daddy relays")
-	fmt.Println("  msg                      List stored messages")
+	fmt.Println("  relays probe             Measure relay latency")
+	fmt.Println("  msg [folder]             List inbox (or folder: archive, important, all)")
+	fmt.Println("  msg mv <ID> <folder>     Move a message (signed, synced to Daddy)")
+	fmt.Println("  msg del <ID>             Delete a message (signed tombstone, synced)")
+	fmt.Println("  msg sync                 Pull signed mailbox ops from Daddy")
 	fmt.Println("  open <message ID>        Open a stored message")
 	fmt.Println("  send                     Send a message")
 	fmt.Println("  help                     Show this help")
@@ -251,7 +259,16 @@ func (c *Client) closeSession() {
 }
 
 func (c *Client) listMessages() {
-	messages, err := c.Database.ListMessages()
+	c.listMessagesIn("inbox")
+}
+
+func (c *Client) listMessagesIn(folder string) {
+	name := strings.ToLower(strings.TrimSpace(folder))
+	if name == "" {
+		name = database.FolderInbox
+	}
+
+	messages, err := c.Database.ListMessagesInFolder(name)
 	if err != nil {
 		fmt.Printf(
 			"msg: %v\n",
@@ -261,13 +278,14 @@ func (c *Client) listMessages() {
 	}
 
 	if len(messages) == 0 {
-		fmt.Println(
-			"No messages.",
+		fmt.Printf(
+			"No messages in %q.\n",
+			name,
 		)
 		return
 	}
 
-	fmt.Println()
+	fmt.Printf("\nFolder: %s\n\n", name)
 	fmt.Printf(
 		"%-64s  %-8s  %-24s  %s\n",
 		"ID",
@@ -349,6 +367,200 @@ func (c *Client) openMessage(
 	)
 	fmt.Println()
 	fmt.Println(msg.Body)
+	fmt.Println()
+}
+
+// handleMsgCommand routes msg inbox/folder views and signed mutations.
+func (c *Client) handleMsgCommand(args []string) {
+	if len(args) == 0 {
+		c.listMessagesIn(database.FolderInbox)
+		return
+	}
+
+	switch strings.ToLower(args[0]) {
+	case "sync":
+		c.syncMailbox()
+		return
+	case "mv":
+		if len(args) != 3 {
+			fmt.Println("Usage: msg mv <message ID> <folder>")
+			return
+		}
+		c.moveMessage(args[1], args[2])
+		return
+	case "del", "delete", "rm":
+		if len(args) != 2 {
+			fmt.Println("Usage: msg del <message ID>")
+			return
+		}
+		c.deleteMessage(args[1])
+		return
+	}
+
+	if len(args) == 1 {
+		c.listMessagesIn(args[0])
+		return
+	}
+
+	fmt.Println("Usage: msg [folder] | msg mv <ID> <folder> | msg del <ID> | msg sync")
+}
+
+// moveMessage signs a move op, applies it locally, then replicates to Daddy.
+func (c *Client) moveMessage(id string, folder string) {
+	target, err := database.NormaliseFolder(folder)
+	if err != nil {
+		fmt.Printf("msg mv: %v\n", err)
+		return
+	}
+
+	if _, err := c.Database.GetMessage(strings.TrimSpace(id)); err != nil {
+		fmt.Printf("msg mv: %v\n", err)
+		return
+	}
+
+	op, err := message.SignMailboxOp(
+		c.Identity.PrivateKey,
+		c.Identity.Namespace,
+		c.Identity.PublicKey,
+		strings.TrimSpace(id),
+		message.MailboxOpMove,
+		target,
+		time.Now().Unix(),
+	)
+	if err != nil {
+		fmt.Printf("msg mv: %v\n", err)
+		return
+	}
+
+	if err := c.applySignedOp(op); err != nil {
+		fmt.Printf("msg mv: %v\n", err)
+		return
+	}
+
+	fmt.Printf("Moved %s to %q.\n", strings.TrimSpace(id), target)
+}
+
+// deleteMessage signs a delete tombstone, applies it, replicates to Daddy.
+func (c *Client) deleteMessage(id string) {
+	if _, err := c.Database.GetMessage(strings.TrimSpace(id)); err != nil {
+		fmt.Printf("msg del: %v\n", err)
+		return
+	}
+
+	op, err := message.SignMailboxOp(
+		c.Identity.PrivateKey,
+		c.Identity.Namespace,
+		c.Identity.PublicKey,
+		strings.TrimSpace(id),
+		message.MailboxOpDelete,
+		"",
+		time.Now().Unix(),
+	)
+	if err != nil {
+		fmt.Printf("msg del: %v\n", err)
+		return
+	}
+
+	if err := c.applySignedOp(op); err != nil {
+		fmt.Printf("msg del: %v\n", err)
+		return
+	}
+
+	fmt.Printf("Deleted %s.\n", strings.TrimSpace(id))
+}
+
+// applySignedOp verifies author-is-self, applies LWW state, broadcasts.
+func (c *Client) applySignedOp(op *message.MailboxOpRequest) error {
+	if err := op.Verify(); err != nil {
+		return err
+	}
+
+	selfKey := hex.EncodeToString(c.Identity.PublicKey)
+
+	if op.AuthorNS != c.Identity.Namespace ||
+		!strings.EqualFold(op.AuthorKey, selfKey) {
+		return fmt.Errorf("op author is not this device")
+	}
+
+	authorKey, err := hex.DecodeString(op.AuthorKey)
+	if err != nil {
+		return err
+	}
+
+	signature, err := hex.DecodeString(op.Signature)
+	if err != nil {
+		return err
+	}
+
+	if _, err := c.Database.ApplyMailboxOp(database.MailboxOp{
+		MessageID: op.MessageID,
+		Op:        strings.ToLower(strings.TrimSpace(op.Op)),
+		Folder:    strings.ToLower(strings.TrimSpace(op.Folder)),
+		AuthorNS:  op.AuthorNS,
+		AuthorKey: authorKey,
+		Timestamp: op.Timestamp,
+		Signature: signature,
+	}); err != nil {
+		return err
+	}
+
+	if err := network.BroadcastMailboxOp(c.Identity, c.Database, op); err != nil {
+		fmt.Printf("Daddy sync deferred (%v); local state kept.\n", err)
+	}
+
+	c.syncMailboxQuiet()
+
+	return nil
+}
+
+// syncMailbox pulls signed ops from all relays and applies verified state.
+func (c *Client) syncMailbox() {
+	since, err := c.mailboxWatermark()
+	if err != nil {
+		since = 0
+	}
+
+	next := network.SyncMailboxOpsAll(c.Identity, c.Database, since)
+
+	if err := c.Database.SetMeta("mailbox_since", strconv.FormatInt(next, 10)); err != nil {
+		fmt.Printf("msg sync: %v\n", err)
+		return
+	}
+
+	fmt.Printf("Mailbox synced (%d -> %d).\n", since, next)
+}
+
+func (c *Client) syncMailboxQuiet() {
+	since, err := c.mailboxWatermark()
+	if err != nil {
+		return
+	}
+
+	next := network.SyncMailboxOpsAll(c.Identity, c.Database, since)
+
+	_ = c.Database.SetMeta("mailbox_since", strconv.FormatInt(next, 10))
+}
+
+func (c *Client) mailboxWatermark() (int64, error) {
+	raw, err := c.Database.GetMeta("mailbox_since")
+	if err != nil || strings.TrimSpace(raw) == "" {
+		return 0, nil
+	}
+
+	return strconv.ParseInt(strings.TrimSpace(raw), 10, 64)
+}
+
+func (c *Client) probeRelays() {
+	results := network.ProbeRelaysAll(c.Identity, c.Database)
+
+	fmt.Println()
+	fmt.Println("Relay latency (ms, -1 = unreachable):")
+	fmt.Println()
+
+	for relay, ms := range results {
+		fmt.Printf("  %-28s %d\n", relay, ms)
+	}
+
 	fmt.Println()
 }
 

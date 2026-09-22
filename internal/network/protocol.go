@@ -121,6 +121,14 @@ const (
 	messageTypeDeliveryAck      = "DELIVERY_ACK"
 	messageTypeDeleteMessage    = "DELETE_MESSAGE"
 	messageTypeDeleteAck        = "DELETE_ACK"
+	messageTypeMailboxOp        = "MAILBOX_OP"
+	messageTypeMailboxOpAck     = "MAILBOX_OP_ACK"
+	messageTypeMailboxSync      = "MAILBOX_SYNC"
+	messageTypeMailboxState     = "MAILBOX_STATE"
+	messageTypeRelayProbe       = "RELAY_PROBE"
+	messageTypeRelayProbeAck    = "RELAY_PROBE_ACK"
+	messageTypeGhostForward     = "GHOST_FORWARD"
+	messageTypeGhostForwardAck  = "GHOST_FORWARD_ACK"
 )
 
 // Acknowledgement status values.
@@ -130,6 +138,7 @@ const (
 	statusAlreadyStored = "already_stored"
 	statusRejected      = "rejected"
 	statusOK            = "ok"
+	statusSynced        = "synced"
 )
 
 // Message is the framed envelope carried by every protocol exchange.

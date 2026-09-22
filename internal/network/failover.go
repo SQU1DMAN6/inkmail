@@ -3,6 +3,7 @@ package network
 // failover.go tries each configured relay in turn so one dead Daddy never blocks a send, lookup or fetch (SPEC v0.5 sections 18, 19, Tests E/F).
 
 import (
+	"strconv"
 	"strings"
 
 	"github.com/SQU1DMAN6/inkmail/internal/database"
@@ -124,4 +125,35 @@ func isAuthenticatedForwarder(session *Session, db *database.Database, envelope 
 	}
 	_ = db.RecordPeerIdentityWithKey(session.PeerNamespace, []byte(session.Peer), session.PeerEncryptionKey)
 	return envelope.Verify() == nil
+}
+
+// syncMailboxFromDaddyQuiet pulls verified ops in the background daemon.
+// Failures are silent: the next tick or manual `msg sync` retries.
+func syncMailboxFromDaddyQuiet(
+	daddyAddress string,
+	local *identity.Identity,
+	db *database.Database,
+) {
+	raw, err := db.GetMeta("mailbox_since")
+	if err != nil {
+		return
+	}
+
+	raw = strings.TrimSpace(raw)
+
+	var since int64
+
+	if raw != "" {
+		since, err = strconv.ParseInt(raw, 10, 64)
+		if err != nil {
+			return
+		}
+	}
+
+	next, err := mailboxSyncFromDaddy(daddyAddress, local, db, since)
+	if err != nil {
+		return
+	}
+
+	_ = db.SetMeta("mailbox_since", strconv.FormatInt(next, 10))
 }

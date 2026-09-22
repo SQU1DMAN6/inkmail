@@ -162,6 +162,18 @@ func dispatchRequest(
 	case messageTypeDeleteMessage:
 		return handleDeleteMessage(session, db, request.Data)
 
+	case messageTypeMailboxOp:
+		return handleMailboxOp(session, db, request.Data)
+
+	case messageTypeMailboxSync:
+		return handleMailboxSync(session, db, request.Data)
+
+	case messageTypeRelayProbe:
+		return handleRelayProbe(session, local, db, request.Data)
+
+	case messageTypeGhostForward:
+		return handleGhostForward(session, local, db, request.Data)
+
 	default:
 		return fmt.Errorf(
 			"unsupported protocol message %q",
