@@ -40,38 +40,78 @@ const maxOpClockFuture = 15 * time.Minute
 
 // MailboxOpRequest is the signed wire form of one move/delete mutation.
 type MailboxOpRequest struct {
-	MessageID string `json:"message_id"`
-	Op        string `json:"op"`
-	Folder    string `json:"folder,omitempty"`
-	AuthorNS  string `json:"author_namespace"`
-	AuthorKey string `json:"author_public_key"`
-	Timestamp int64  `json:"timestamp"`
-	Signature string `json:"signature"`
+	MessageID    string `json:"message_id"`
+	Op           string `json:"op"`
+	Folder       string `json:"folder,omitempty"`
+	SenderNS     string `json:"sender_namespace,omitempty"`
+	SenderKey    string `json:"sender_public_key,omitempty"`
+	RecipientNS  string `json:"recipient_namespace,omitempty"`
+	RecipientKey string `json:"recipient_public_key,omitempty"`
+	AuthorNS     string `json:"author_namespace"`
+	AuthorKey    string `json:"author_public_key"`
+	Timestamp    int64  `json:"timestamp"`
+	Signature    string `json:"signature"`
 }
 
 // signingBytes returns the canonical bytes covered by the op signature.
 func (o *MailboxOpRequest) signingBytes() []byte {
 	type unsignedOp struct {
-		Label     string `json:"label"`
-		MessageID string `json:"message_id"`
-		Op        string `json:"op"`
-		Folder    string `json:"folder"`
-		AuthorNS  string `json:"author_namespace"`
-		AuthorKey string `json:"author_public_key"`
-		Timestamp int64  `json:"timestamp"`
+		Label        string `json:"label"`
+		MessageID    string `json:"message_id"`
+		Op           string `json:"op"`
+		Folder       string `json:"folder"`
+		SenderNS     string `json:"sender_namespace"`
+		SenderKey    string `json:"sender_public_key"`
+		RecipientNS  string `json:"recipient_namespace"`
+		RecipientKey string `json:"recipient_public_key"`
+		AuthorNS     string `json:"author_namespace"`
+		AuthorKey    string `json:"author_public_key"`
+		Timestamp    int64  `json:"timestamp"`
 	}
 
 	data, _ := json.Marshal(unsignedOp{
-		Label:     mailboxOpLabel,
-		MessageID: o.MessageID,
-		Op:        strings.ToLower(strings.TrimSpace(o.Op)),
-		Folder:    strings.ToLower(strings.TrimSpace(o.Folder)),
-		AuthorNS:  o.AuthorNS,
-		AuthorKey: o.AuthorKey,
-		Timestamp: o.Timestamp,
+		Label:        mailboxOpLabel,
+		MessageID:    o.MessageID,
+		Op:           strings.ToLower(strings.TrimSpace(o.Op)),
+		Folder:       strings.ToLower(strings.TrimSpace(o.Folder)),
+		SenderNS:     o.SenderNS,
+		SenderKey:    strings.ToLower(strings.TrimSpace(o.SenderKey)),
+		RecipientNS:  o.RecipientNS,
+		RecipientKey: strings.ToLower(strings.TrimSpace(o.RecipientKey)),
+		AuthorNS:     o.AuthorNS,
+		AuthorKey:    o.AuthorKey,
+		Timestamp:    o.Timestamp,
 	})
 
 	return data
+}
+
+// SignMailboxOpForMessage signs a mailbox operation with the message's
+// routing identities so Daddy can authorize operations after delivery.
+func SignMailboxOpForMessage(
+	signerPrivateKey ed25519.PrivateKey,
+	authorNS string,
+	authorPublicKey ed25519.PublicKey,
+	stored *Message,
+	op string,
+	folder string,
+	timestamp int64,
+) (*MailboxOpRequest, error) {
+	if stored == nil {
+		return nil, fmt.Errorf("mailbox op has no message")
+	}
+
+	req, err := SignMailboxOp(signerPrivateKey, authorNS, authorPublicKey,
+		stored.ID, op, folder, timestamp)
+	if err != nil {
+		return nil, err
+	}
+	req.SenderNS = stored.SenderNamespace
+	req.SenderKey = strings.ToLower(strings.TrimSpace(stored.SenderPublicKey))
+	req.RecipientNS = stored.RecipientNamespace
+	req.RecipientKey = strings.ToLower(strings.TrimSpace(stored.RecipientPublicKey))
+	req.Signature = hex.EncodeToString(ed25519.Sign(signerPrivateKey, req.signingBytes()))
+	return req, nil
 }
 
 // SignMailboxOp builds and signs a move/delete op for messageID.

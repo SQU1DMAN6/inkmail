@@ -31,14 +31,18 @@ const (
 
 // MailboxOp is one signed move/delete mutation for a single message.
 type MailboxOp struct {
-	MessageID   string
-	Op          string
-	Folder      string
-	AuthorNS    string
-	AuthorKey   []byte
-	Timestamp   int64
-	Signature   []byte
-	SubmittedAt int64
+	MessageID    string
+	Op           string
+	Folder       string
+	SenderNS     string
+	SenderKey    []byte
+	RecipientNS  string
+	RecipientKey []byte
+	AuthorNS     string
+	AuthorKey    []byte
+	Timestamp    int64
+	Signature    []byte
+	SubmittedAt  int64
 }
 
 type Database struct {
@@ -175,6 +179,10 @@ func (d *Database) init() error {
 		message_id TEXT NOT NULL,
 		op TEXT NOT NULL,
 		folder TEXT NOT NULL DEFAULT '',
+		sender_namespace TEXT NOT NULL DEFAULT '',
+		sender_public_key BLOB NOT NULL DEFAULT X'',
+		recipient_namespace TEXT NOT NULL DEFAULT '',
+		recipient_public_key BLOB NOT NULL DEFAULT X'',
 		author_namespace TEXT NOT NULL,
 		author_public_key BLOB NOT NULL,
 		timestamp INTEGER NOT NULL,
@@ -250,6 +258,14 @@ func (d *Database) migrate() error {
 		 ADD COLUMN folder_updated_at INTEGER NOT NULL DEFAULT 0`,
 		`ALTER TABLE messages
 		 ADD COLUMN folder_updated_signature BLOB NOT NULL DEFAULT X''`,
+		`ALTER TABLE mailbox_ops
+		 ADD COLUMN sender_namespace TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE mailbox_ops
+		 ADD COLUMN sender_public_key BLOB NOT NULL DEFAULT X''`,
+		`ALTER TABLE mailbox_ops
+		 ADD COLUMN recipient_namespace TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE mailbox_ops
+		 ADD COLUMN recipient_public_key BLOB NOT NULL DEFAULT X''`,
 	}
 
 	for _, statement := range migrations {
@@ -764,12 +780,15 @@ func (d *Database) ApplyMailboxOp(op MailboxOp) (bool, error) {
 	if _, err := d.DB.Exec(`
 		INSERT INTO mailbox_ops(
 			message_id, op, folder,
+			sender_namespace, sender_public_key,
+			recipient_namespace, recipient_public_key,
 			author_namespace, author_public_key,
 			timestamp, signature, submitted_at
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT(message_id, op, timestamp, author_public_key)
 		DO NOTHING
-	`, op.MessageID, op.Op, folder, op.AuthorNS, op.AuthorKey,
+	`, op.MessageID, op.Op, folder, op.SenderNS, op.SenderKey,
+		op.RecipientNS, op.RecipientKey, op.AuthorNS, op.AuthorKey,
 		op.Timestamp, op.Signature, now); err != nil {
 		return false, fmt.Errorf("record mailbox op: %w", err)
 	}
@@ -799,6 +818,8 @@ func (d *Database) ListMailboxOpsSince(since int64, limit int) ([]MailboxOp, int
 	}
 	rows, err := d.DB.Query(`
 		SELECT rowid, message_id, op, folder,
+			sender_namespace, sender_public_key,
+			recipient_namespace, recipient_public_key,
 			author_namespace, author_public_key,
 			timestamp, signature, submitted_at
 		FROM mailbox_ops
@@ -816,6 +837,7 @@ func (d *Database) ListMailboxOpsSince(since int64, limit int) ([]MailboxOp, int
 		var op MailboxOp
 		var rowid int64
 		if err := rows.Scan(&rowid, &op.MessageID, &op.Op, &op.Folder,
+			&op.SenderNS, &op.SenderKey, &op.RecipientNS, &op.RecipientKey,
 			&op.AuthorNS, &op.AuthorKey, &op.Timestamp, &op.Signature,
 			&op.SubmittedAt); err != nil {
 			return nil, since, fmt.Errorf("scan mailbox op: %w", err)

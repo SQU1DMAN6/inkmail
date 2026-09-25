@@ -13,13 +13,17 @@ import (
 
 // mailboxOpBody is the wire body of MAILBOX_OP: one signed mutation.
 type mailboxOpBody struct {
-	MessageID string `json:"message_id"`
-	Op        string `json:"op"`
-	Folder    string `json:"folder,omitempty"`
-	AuthorNS  string `json:"author_namespace"`
-	AuthorKey string `json:"author_public_key"`
-	Timestamp int64  `json:"timestamp"`
-	Signature string `json:"signature"`
+	MessageID    string `json:"message_id"`
+	Op           string `json:"op"`
+	Folder       string `json:"folder,omitempty"`
+	SenderNS     string `json:"sender_namespace,omitempty"`
+	SenderKey    string `json:"sender_public_key,omitempty"`
+	RecipientNS  string `json:"recipient_namespace,omitempty"`
+	RecipientKey string `json:"recipient_public_key,omitempty"`
+	AuthorNS     string `json:"author_namespace"`
+	AuthorKey    string `json:"author_public_key"`
+	Timestamp    int64  `json:"timestamp"`
+	Signature    string `json:"signature"`
 }
 
 // mailboxSyncRequest asks Daddy for ops newer than Since.
@@ -39,26 +43,34 @@ type mailboxStateBody struct {
 // toWireOp converts a stored op to its wire form.
 func toWireOp(op database.MailboxOp) mailboxOpBody {
 	return mailboxOpBody{
-		MessageID: op.MessageID,
-		Op:        op.Op,
-		Folder:    op.Folder,
-		AuthorNS:  op.AuthorNS,
-		AuthorKey: hex.EncodeToString(op.AuthorKey),
-		Timestamp: op.Timestamp,
-		Signature: hex.EncodeToString(op.Signature),
+		MessageID:    op.MessageID,
+		Op:           op.Op,
+		Folder:       op.Folder,
+		SenderNS:     op.SenderNS,
+		SenderKey:    hex.EncodeToString(op.SenderKey),
+		RecipientNS:  op.RecipientNS,
+		RecipientKey: hex.EncodeToString(op.RecipientKey),
+		AuthorNS:     op.AuthorNS,
+		AuthorKey:    hex.EncodeToString(op.AuthorKey),
+		Timestamp:    op.Timestamp,
+		Signature:    hex.EncodeToString(op.Signature),
 	}
 }
 
 // toSignedRequest converts a wire op to the verifiable signed form.
 func toSignedRequest(body mailboxOpBody) *message.MailboxOpRequest {
 	return &message.MailboxOpRequest{
-		MessageID: body.MessageID,
-		Op:        body.Op,
-		Folder:    body.Folder,
-		AuthorNS:  body.AuthorNS,
-		AuthorKey: body.AuthorKey,
-		Timestamp: body.Timestamp,
-		Signature: body.Signature,
+		MessageID:    body.MessageID,
+		Op:           body.Op,
+		Folder:       body.Folder,
+		SenderNS:     body.SenderNS,
+		SenderKey:    body.SenderKey,
+		RecipientNS:  body.RecipientNS,
+		RecipientKey: body.RecipientKey,
+		AuthorNS:     body.AuthorNS,
+		AuthorKey:    body.AuthorKey,
+		Timestamp:    body.Timestamp,
+		Signature:    body.Signature,
 	}
 }
 
@@ -112,7 +124,19 @@ func verifyMailboxAuthor(
 
 	owned, err := mailboxMessageOwnership(db, body.MessageID)
 	if err != nil {
-		return fmt.Errorf("unknown message: %w", err)
+		senderKey, senderErr := decodeHexField(body.SenderKey)
+		recipientKey, recipientErr := decodeHexField(body.RecipientKey)
+		if senderErr != nil || recipientErr != nil ||
+			body.SenderNS == "" || body.RecipientNS == "" {
+			return fmt.Errorf("unknown message: %w", err)
+		}
+		owned = &database.MailboxMessage{
+			ID:                 body.MessageID,
+			SenderNamespace:    body.SenderNS,
+			SenderPublicKey:    senderKey,
+			RecipientNamespace: body.RecipientNS,
+			RecipientPublicKey: recipientKey,
+		}
 	}
 
 	senderKey := owned.SenderPublicKey
@@ -157,14 +181,32 @@ func handleMailboxOp(
 		return replyMailboxOpAck(session, body.MessageID, statusRejected, err.Error())
 	}
 
+	var senderKey, recipientKey []byte
+	if body.SenderNS != "" && body.RecipientNS != "" {
+		var senderErr, recipientErr error
+		senderKey, senderErr = decodeHexField(body.SenderKey)
+		recipientKey, recipientErr = decodeHexField(body.RecipientKey)
+		if senderErr != nil || recipientErr != nil {
+			return replyMailboxOpAck(session, body.MessageID, statusRejected, "invalid message ownership")
+		}
+		if err := db.RegisterMailboxMessage(body.MessageID, body.SenderNS,
+			senderKey, body.RecipientNS, recipientKey, 0); err != nil {
+			return replyMailboxOpAck(session, body.MessageID, statusRejected, err.Error())
+		}
+	}
+
 	op := database.MailboxOp{
-		MessageID: strings.TrimSpace(body.MessageID),
-		Op:        strings.ToLower(strings.TrimSpace(body.Op)),
-		Folder:    strings.ToLower(strings.TrimSpace(body.Folder)),
-		AuthorNS:  body.AuthorNS,
-		AuthorKey: authorKey,
-		Timestamp: body.Timestamp,
-		Signature: signature,
+		MessageID:    strings.TrimSpace(body.MessageID),
+		Op:           strings.ToLower(strings.TrimSpace(body.Op)),
+		Folder:       strings.ToLower(strings.TrimSpace(body.Folder)),
+		SenderNS:     body.SenderNS,
+		SenderKey:    senderKey,
+		RecipientNS:  body.RecipientNS,
+		RecipientKey: recipientKey,
+		AuthorNS:     body.AuthorNS,
+		AuthorKey:    authorKey,
+		Timestamp:    body.Timestamp,
+		Signature:    signature,
 	}
 
 	if _, err := db.ApplyMailboxOp(op); err != nil {
@@ -218,7 +260,17 @@ func handleMailboxSync(
 	for _, op := range ops {
 		held, err := mailboxMessageOwnership(db, op.MessageID)
 		if err != nil {
-			continue
+			if len(op.SenderKey) == 0 || len(op.RecipientKey) == 0 ||
+				op.SenderNS == "" || op.RecipientNS == "" {
+				continue
+			}
+			held = &database.MailboxMessage{
+				ID:                 op.MessageID,
+				SenderNamespace:    op.SenderNS,
+				SenderPublicKey:    op.SenderKey,
+				RecipientNamespace: op.RecipientNS,
+				RecipientPublicKey: op.RecipientKey,
+			}
 		}
 
 		senderKey := held.SenderPublicKey
@@ -258,13 +310,17 @@ func SendMailboxOp(
 	if err := sendMessage(session, Message{
 		Type: messageTypeMailboxOp,
 		Data: marshalJSON(mailboxOpBody{
-			MessageID: op.MessageID,
-			Op:        op.Op,
-			Folder:    op.Folder,
-			AuthorNS:  op.AuthorNS,
-			AuthorKey: op.AuthorKey,
-			Timestamp: op.Timestamp,
-			Signature: op.Signature,
+			MessageID:    op.MessageID,
+			Op:           op.Op,
+			Folder:       op.Folder,
+			SenderNS:     op.SenderNS,
+			SenderKey:    op.SenderKey,
+			RecipientNS:  op.RecipientNS,
+			RecipientKey: op.RecipientKey,
+			AuthorNS:     op.AuthorNS,
+			AuthorKey:    op.AuthorKey,
+			Timestamp:    op.Timestamp,
+			Signature:    op.Signature,
 		}),
 	}); err != nil {
 		return err

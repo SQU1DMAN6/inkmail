@@ -336,6 +336,14 @@ func (c *Client) openMessage(
 		return
 	}
 
+	if folder, err := c.Database.GetMessageFolder(id); err != nil {
+		fmt.Printf("open message: %v\n", err)
+		return
+	} else if folder == database.FolderDeleted {
+		fmt.Printf("open message: message %q is deleted\n", id)
+		return
+	}
+
 	msg := stored.Message
 
 	fmt.Println()
@@ -420,16 +428,17 @@ func (c *Client) moveMessage(id string, folder string) {
 		return
 	}
 
-	if _, err := c.Database.GetMessage(strings.TrimSpace(id)); err != nil {
+	stored, err := c.Database.GetMessage(strings.TrimSpace(id))
+	if err != nil {
 		fmt.Printf("msg mv: %v\n", err)
 		return
 	}
 
-	op, err := message.SignMailboxOp(
+	op, err := message.SignMailboxOpForMessage(
 		c.Identity.PrivateKey,
 		c.Identity.Namespace,
 		c.Identity.PublicKey,
-		strings.TrimSpace(id),
+		&stored.Message,
 		message.MailboxOpMove,
 		target,
 		time.Now().Unix(),
@@ -449,16 +458,17 @@ func (c *Client) moveMessage(id string, folder string) {
 
 // deleteMessage signs a delete tombstone, applies it, replicates to Daddy.
 func (c *Client) deleteMessage(id string) {
-	if _, err := c.Database.GetMessage(strings.TrimSpace(id)); err != nil {
+	stored, err := c.Database.GetMessage(strings.TrimSpace(id))
+	if err != nil {
 		fmt.Printf("msg del: %v\n", err)
 		return
 	}
 
-	op, err := message.SignMailboxOp(
+	op, err := message.SignMailboxOpForMessage(
 		c.Identity.PrivateKey,
 		c.Identity.Namespace,
 		c.Identity.PublicKey,
-		strings.TrimSpace(id),
+		&stored.Message,
 		message.MailboxOpDelete,
 		"",
 		time.Now().Unix(),
@@ -499,14 +509,28 @@ func (c *Client) applySignedOp(op *message.MailboxOpRequest) error {
 		return err
 	}
 
+	senderKey, err := hex.DecodeString(op.SenderKey)
+	if err != nil {
+		return err
+	}
+
+	recipientKey, err := hex.DecodeString(op.RecipientKey)
+	if err != nil {
+		return err
+	}
+
 	if _, err := c.Database.ApplyMailboxOp(database.MailboxOp{
-		MessageID: op.MessageID,
-		Op:        strings.ToLower(strings.TrimSpace(op.Op)),
-		Folder:    strings.ToLower(strings.TrimSpace(op.Folder)),
-		AuthorNS:  op.AuthorNS,
-		AuthorKey: authorKey,
-		Timestamp: op.Timestamp,
-		Signature: signature,
+		MessageID:    op.MessageID,
+		Op:           strings.ToLower(strings.TrimSpace(op.Op)),
+		Folder:       strings.ToLower(strings.TrimSpace(op.Folder)),
+		SenderNS:     op.SenderNS,
+		SenderKey:    senderKey,
+		RecipientNS:  op.RecipientNS,
+		RecipientKey: recipientKey,
+		AuthorNS:     op.AuthorNS,
+		AuthorKey:    authorKey,
+		Timestamp:    op.Timestamp,
+		Signature:    signature,
 	}); err != nil {
 		return err
 	}
