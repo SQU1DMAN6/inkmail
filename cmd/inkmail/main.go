@@ -153,8 +153,9 @@ func (c *Client) handleCommand(
 
 	case "identity":
 		fmt.Printf(
-			"Identity: %s\n",
+			"Identity: %s\nFull identity: %s\n",
 			identity.Address(c.Identity),
+			identity.AddressFull(c.Identity),
 		)
 
 	case "peers":

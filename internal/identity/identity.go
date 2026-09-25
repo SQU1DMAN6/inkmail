@@ -360,6 +360,16 @@ func Address(
 	)
 }
 
+func AddressFull(
+	id *Identity,
+) string {
+	return fmt.Sprintf(
+		"%s::%s",
+		id.Namespace,
+		hex.EncodeToString(id.PublicKey),
+	)
+}
+
 func FingerprintFromHex(
 	publicKey string,
 ) string {
