@@ -167,6 +167,7 @@ func (d *Database) init() error {
 		status TEXT NOT NULL,
 		folder TEXT NOT NULL DEFAULT 'inbox',
 		folder_updated_at INTEGER NOT NULL DEFAULT 0,
+		folder_updated_signature BLOB NOT NULL DEFAULT X'',
 		stored_at INTEGER NOT NULL
 	);
 
@@ -209,6 +210,16 @@ func (d *Database) init() error {
 	CREATE INDEX IF NOT EXISTS
 		idx_held_messages_expires_at
 	ON held_messages(expires_at);
+
+	CREATE TABLE IF NOT EXISTS mailbox_messages (
+		id TEXT PRIMARY KEY,
+		sender_namespace TEXT NOT NULL,
+		sender_public_key BLOB NOT NULL,
+		recipient_namespace TEXT NOT NULL,
+		recipient_public_key BLOB NOT NULL,
+		created_at INTEGER NOT NULL,
+		stored_at INTEGER NOT NULL
+	);
 	`
 
 	if _, err := d.DB.Exec(schema); err != nil {
@@ -237,6 +248,8 @@ func (d *Database) migrate() error {
 		 ADD COLUMN folder TEXT NOT NULL DEFAULT 'inbox'`,
 		`ALTER TABLE messages
 		 ADD COLUMN folder_updated_at INTEGER NOT NULL DEFAULT 0`,
+		`ALTER TABLE messages
+		 ADD COLUMN folder_updated_signature BLOB NOT NULL DEFAULT X''`,
 	}
 
 	for _, statement := range migrations {
@@ -761,9 +774,14 @@ func (d *Database) ApplyMailboxOp(op MailboxOp) (bool, error) {
 		return false, fmt.Errorf("record mailbox op: %w", err)
 	}
 	res, err := d.DB.Exec(`
-		UPDATE messages SET folder = ?, folder_updated_at = ?
-		WHERE id = ? AND folder_updated_at < ?
-	`, folder, op.Timestamp, op.MessageID, op.Timestamp)
+		UPDATE messages
+		SET folder = ?, folder_updated_at = ?, folder_updated_signature = ?
+		WHERE id = ? AND (
+			folder_updated_at < ? OR
+			(folder_updated_at = ? AND folder_updated_signature < ?)
+		)
+	`, folder, op.Timestamp, op.Signature, op.MessageID,
+		op.Timestamp, op.Timestamp, op.Signature)
 	if err != nil {
 		return false, fmt.Errorf("apply mailbox op: %w", err)
 	}
@@ -1100,10 +1118,71 @@ type HeldMessage struct {
 	StoredAt           int64
 }
 
+// MailboxMessage records the identities needed to authorise mailbox ops.
+// Unlike held_messages, this metadata survives successful delivery.
+type MailboxMessage struct {
+	ID                 string
+	SenderNamespace    string
+	SenderPublicKey    []byte
+	RecipientNamespace string
+	RecipientPublicKey []byte
+	CreatedAt          int64
+	StoredAt           int64
+}
+
+// RegisterMailboxMessage records durable ownership metadata for a message.
+func (d *Database) RegisterMailboxMessage(
+	id string,
+	senderNamespace string,
+	senderPublicKey []byte,
+	recipientNamespace string,
+	recipientPublicKey []byte,
+	createdAt int64,
+) error {
+	_, err := d.DB.Exec(`
+		INSERT INTO mailbox_messages(
+			id, sender_namespace, sender_public_key,
+			recipient_namespace, recipient_public_key, created_at, stored_at
+		) VALUES (?, ?, ?, ?, ?, ?, ?)
+		ON CONFLICT(id) DO NOTHING
+	`, id, senderNamespace, senderPublicKey, recipientNamespace,
+		recipientPublicKey, createdAt, time.Now().Unix())
+	if err != nil {
+		return fmt.Errorf("register mailbox message: %w", err)
+	}
+	return nil
+}
+
+// GetMailboxMessage retrieves ownership metadata retained after delivery.
+func (d *Database) GetMailboxMessage(id string) (*MailboxMessage, error) {
+	row := d.DB.QueryRow(`
+		SELECT id, sender_namespace, sender_public_key,
+			recipient_namespace, recipient_public_key, created_at, stored_at
+		FROM mailbox_messages
+		WHERE id = ?
+	`, id)
+
+	var stored MailboxMessage
+	if err := row.Scan(&stored.ID, &stored.SenderNamespace,
+		&stored.SenderPublicKey, &stored.RecipientNamespace,
+		&stored.RecipientPublicKey, &stored.CreatedAt, &stored.StoredAt); err != nil {
+		if err == sql.ErrNoRows {
+			return nil, fmt.Errorf("mailbox message %q not found", id)
+		}
+		return nil, fmt.Errorf("get mailbox message: %w", err)
+	}
+	return &stored, nil
+}
+
 // StoreHeldMessage stores an encrypted message for hold-and-forward delivery
 func (d *Database) StoreHeldMessage(id string, senderNamespace string, senderPublicKey []byte,
 	recipientNamespace string, recipientPublicKey []byte, payload []byte,
 	createdAt int64, expiresAt int64) error {
+	if err := d.RegisterMailboxMessage(id, senderNamespace, senderPublicKey,
+		recipientNamespace, recipientPublicKey, createdAt); err != nil {
+		return err
+	}
+
 	_, err := d.DB.Exec(`
 		INSERT INTO held_messages(id, sender_namespace, sender_public_key,
 			recipient_namespace, recipient_public_key, payload, created_at, expires_at, stored_at)

@@ -62,6 +62,28 @@ func toSignedRequest(body mailboxOpBody) *message.MailboxOpRequest {
 	}
 }
 
+// mailboxMessageOwnership returns durable ownership metadata and supports
+// databases upgraded while a message is still held.
+func mailboxMessageOwnership(db *database.Database, messageID string) (*database.MailboxMessage, error) {
+	owned, err := db.GetMailboxMessage(messageID)
+	if err == nil {
+		return owned, nil
+	}
+
+	held, heldErr := db.GetHeldMessage(messageID)
+	if heldErr != nil {
+		return nil, err
+	}
+
+	return &database.MailboxMessage{
+		ID:                 messageID,
+		SenderNamespace:    held.SenderNamespace,
+		SenderPublicKey:    held.SenderPublicKey,
+		RecipientNamespace: held.RecipientNamespace,
+		RecipientPublicKey: held.RecipientPublicKey,
+	}, nil
+}
+
 // verifyMailboxAuthor checks op signature, session binding and ownership.
 // All three must pass; anything else is rejected without touching state.
 func verifyMailboxAuthor(
@@ -88,18 +110,18 @@ func verifyMailboxAuthor(
 		return err
 	}
 
-	held, err := db.GetHeldMessage(body.MessageID)
+	owned, err := mailboxMessageOwnership(db, body.MessageID)
 	if err != nil {
 		return fmt.Errorf("unknown message: %w", err)
 	}
 
-	senderKey := held.SenderPublicKey
+	senderKey := owned.SenderPublicKey
 
-	recipientKey := held.RecipientPublicKey
+	recipientKey := owned.RecipientPublicKey
 
-	owns := held.SenderNamespace == body.AuthorNS &&
+	owns := owned.SenderNamespace == body.AuthorNS &&
 		sameBytes(senderKey, authorKey) ||
-		held.RecipientNamespace == body.AuthorNS &&
+		owned.RecipientNamespace == body.AuthorNS &&
 			sameBytes(recipientKey, authorKey)
 
 	if !owns {
@@ -194,7 +216,7 @@ func handleMailboxSync(
 	visible := make([]mailboxOpBody, 0, len(ops))
 
 	for _, op := range ops {
-		held, err := db.GetHeldMessage(op.MessageID)
+		held, err := mailboxMessageOwnership(db, op.MessageID)
 		if err != nil {
 			continue
 		}
