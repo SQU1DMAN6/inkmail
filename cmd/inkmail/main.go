@@ -158,7 +158,7 @@ func (c *Client) handleCommand(
 		)
 
 	case "peers":
-		c.printPeers()
+		c.handlePeersCommand(parts[1:])
 
 	case "msg":
 		c.handleMsgCommand(parts[1:])
@@ -200,7 +200,10 @@ func (c *Client) printHelp() {
 	fmt.Println()
 	fmt.Println("Commands:")
 	fmt.Println("  identity                 Show local identity")
-	fmt.Println("  peers                    Show known peer identities")
+	fmt.Println("  peers [list]             List peers, aliases, status, reachability")
+	fmt.Println("  peers add <Peer ID>      Register peer (namespace::FULL-64-hex-key)")
+	fmt.Println("  peers remove <number>    Remove a peer entry, alias and cached routes")
+	fmt.Println("  peers alias <n> <alias>  Set friendly alias (send can use it)")
 	fmt.Println("  relays                   Show configured Daddy relays")
 	fmt.Println("  relays probe             Measure relay latency")
 	fmt.Println("  msg [folder]             List inbox (or folder: archive, important, all)")
@@ -605,23 +608,27 @@ func (c *Client) sendInteractive(
 		return
 	}
 
-	// Display peers with indexes
+	// Display peers with indexes + aliases
 	fmt.Println()
 	fmt.Println("Select recipient:")
 	fmt.Println()
 
 	for i, peer := range peers {
 		fingerprint := hex.EncodeToString(peer.PublicKey[:8])
-		fmt.Printf(
-			"%d. %s::%s\n",
+		label := fmt.Sprintf(
+			"%d. %s::%s",
 			i+1,
 			peer.Namespace,
 			fingerprint,
 		)
+		if peer.Alias != "" {
+			label += fmt.Sprintf(" (%s)", peer.Alias)
+		}
+		fmt.Println(label)
 	}
 
 	fmt.Println()
-	fmt.Print("Recipient (number or identity): ")
+	fmt.Print("Recipient (number, alias or identity): ")
 
 	selection, err := reader.ReadString('\n')
 	if err != nil {
@@ -630,66 +637,25 @@ func (c *Client) sendInteractive(
 
 	selection = strings.TrimSpace(selection)
 
-	// Parse selection
-	var selectedPeer *database.PeerIdentity
-	var recipientNamespace string
-	var recipientPublicKey []byte
-
-	// Try to parse as number first
-	if num, err := strconv.Atoi(selection); err == nil {
-		if num < 1 || num > len(peers) {
-			fmt.Println("Invalid selection.")
-			return
-		}
-		selectedPeer = &peers[num-1]
-		recipientNamespace = peers[num-1].Namespace
-		recipientPublicKey = peers[num-1].PublicKey
-	} else {
-		// Try to parse as identity string
-		// Format: namespace::fingerprint
-		for i, peer := range peers {
-			fingerprint := hex.EncodeToString(peer.PublicKey[:8])
-			expectedIdentity := fmt.Sprintf(
-				"%s::%s",
-				peer.Namespace,
-				fingerprint,
-			)
-			if strings.EqualFold(selection, expectedIdentity) {
-				selectedPeer = &peers[i]
-				recipientNamespace = peers[i].Namespace
-				recipientPublicKey = peers[i].PublicKey
-				break
-			}
-		}
-
-		if selectedPeer == nil {
-			// Try matching by namespace only (fuzzy match)
-			for _, peer := range peers {
-				if strings.EqualFold(selection, peer.Namespace) {
-					selectedPeer = &peer
-					recipientNamespace = peer.Namespace
-					recipientPublicKey = peer.PublicKey
-					break
-				}
-			}
-		}
-
-		if selectedPeer == nil {
-			fmt.Println("Peer not found.")
-			return
-		}
-	}
-
-	if selectedPeer == nil {
-		fmt.Println("No peer selected.")
+	// Parse selection via shared resolver (number -> alias -> identity).
+	selectedPeer, err := c.resolveSendRecipient(selection, peers)
+	if err != nil {
+		fmt.Println(err.Error() + ".")
 		return
 	}
 
-	// Get message details
-	fmt.Printf("\nSending to %s::%s\n",
+	recipientNamespace := selectedPeer.Namespace
+	recipientPublicKey := selectedPeer.PublicKey
+
+	confirmLabel := fmt.Sprintf(
+		"%s::%s",
 		recipientNamespace,
 		hex.EncodeToString(recipientPublicKey[:8]),
 	)
+	if selectedPeer.Alias != "" {
+		confirmLabel += fmt.Sprintf(" (%s)", selectedPeer.Alias)
+	}
+	fmt.Printf("\nSending to %s\n", confirmLabel)
 	fmt.Println()
 
 	fmt.Print("Subject: ")
@@ -842,46 +808,5 @@ func (c *Client) sendMessageToPeer(
 }
 
 func (c *Client) printPeers() {
-	peers, err := c.Database.ListPeerIdentities()
-	if err != nil {
-		fmt.Printf(
-			"list peers: %v\n",
-			err,
-		)
-		return
-	}
-
-	if len(peers) == 0 {
-		fmt.Println()
-		fmt.Println("No known peers.")
-		fmt.Println()
-		fmt.Println(
-			"Use 'invite <address>' to exchange identities with another InkMail node.",
-		)
-		fmt.Println()
-		return
-	}
-
-	fmt.Println()
-	fmt.Println("Known peers:")
-	fmt.Println()
-
-	for i, peer := range peers {
-		fingerprint := identity.FingerprintFromHex(
-			hex.EncodeToString(peer.PublicKey),
-		)
-		fmt.Printf(
-			"%d. %s::%s\n",
-			i+1,
-			peer.Namespace,
-			fingerprint,
-		)
-	}
-
-	fmt.Println()
-	fmt.Printf(
-		"%d peer(s)\n",
-		len(peers),
-	)
-	fmt.Println()
+	c.listPeers()
 }

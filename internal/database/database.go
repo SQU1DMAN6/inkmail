@@ -125,6 +125,7 @@ func (d *Database) init() error {
 		namespace TEXT NOT NULL,
 		public_key BLOB NOT NULL,
 		encryption_public_key BLOB,
+		alias TEXT NOT NULL DEFAULT '',
 		first_seen INTEGER NOT NULL,
 		last_seen INTEGER NOT NULL,
 		PRIMARY KEY(namespace, public_key)
@@ -133,6 +134,11 @@ func (d *Database) init() error {
 	CREATE INDEX IF NOT EXISTS
 		idx_peer_identities_public_key
 	ON peer_identities(public_key);
+
+	CREATE UNIQUE INDEX IF NOT EXISTS
+		idx_peer_identities_alias
+	ON peer_identities(alias COLLATE NOCASE)
+	WHERE alias != '';
 
 	CREATE TABLE IF NOT EXISTS peer_routes (
 		namespace TEXT NOT NULL,
@@ -225,6 +231,8 @@ func (d *Database) migrate() error {
 	migrations := []string{
 		`ALTER TABLE peer_identities
 		 ADD COLUMN encryption_public_key BLOB`,
+		`ALTER TABLE peer_identities
+		 ADD COLUMN alias TEXT NOT NULL DEFAULT ''`,
 		`ALTER TABLE messages
 		 ADD COLUMN folder TEXT NOT NULL DEFAULT 'inbox'`,
 		`ALTER TABLE messages
@@ -242,6 +250,22 @@ func (d *Database) migrate() error {
 				err,
 			)
 		}
+	}
+
+	// Case-insensitive alias uniqueness for databases created before the
+	// partial unique index existed. The CREATE in init() covers fresh DBs;
+	// this covers upgraded DBs. Best-effort: a pre-existing duplicate keeps
+	// the DB usable and SetPeerAlias enforces uniqueness going forward.
+	if _, err := d.DB.Exec(`CREATE UNIQUE INDEX IF NOT EXISTS
+		idx_peer_identities_alias
+	ON peer_identities(alias COLLATE NOCASE)
+	WHERE alias != ''`); err != nil {
+		return fmt.Errorf("apply alias index migration: %w", err)
+	}
+
+	// Normalise legacy alias values: trim whitespace, drop empties to ''.
+	if _, err := d.DB.Exec(`UPDATE peer_identities SET alias = '' WHERE TRIM(alias) = ''`); err != nil {
+		return fmt.Errorf("normalise peer aliases: %w", err)
 	}
 
 	// SPEC v0.5 section 13: the user-visible "in" direction becomes
@@ -332,6 +356,8 @@ func (d *Database) GetMeta(
 // RecordPeerIdentity stores or refreshes a known peer identity. The peer's
 // X25519 encryption public key is optional; when supplied it is persisted so
 // that end-to-end encrypted messages can later be addressed to the peer.
+// The alias is preserved on refresh: handshake-driven updates must never wipe
+// a user-assigned friendly name.
 func (d *Database) RecordPeerIdentity(
 	namespace string,
 	publicKey []byte,
@@ -357,10 +383,11 @@ func (d *Database) RecordPeerIdentityWithKey(
 			namespace,
 			public_key,
 			encryption_public_key,
+			alias,
 			first_seen,
 			last_seen
 		)
-		VALUES (?, ?, ?, ?, ?)
+		VALUES (?, ?, ?, '', ?, ?)
 		ON CONFLICT(namespace, public_key)
 		DO UPDATE SET
 			encryption_public_key = COALESCE(
@@ -394,6 +421,7 @@ func (d *Database) ListPeerIdentities() ([]PeerIdentity, error) {
 			namespace,
 			public_key,
 			encryption_public_key,
+			alias,
 			first_seen,
 			last_seen
 		FROM peer_identities
@@ -416,6 +444,7 @@ func (d *Database) ListPeerIdentities() ([]PeerIdentity, error) {
 			&peer.Namespace,
 			&peer.PublicKey,
 			&encryptionKey,
+			&peer.Alias,
 			&peer.FirstSeen,
 			&peer.LastSeen,
 		); err != nil {
@@ -487,6 +516,7 @@ type PeerIdentity struct {
 	Namespace           string
 	PublicKey           []byte
 	EncryptionPublicKey []byte
+	Alias               string
 	FirstSeen           int64
 	LastSeen            int64
 }
