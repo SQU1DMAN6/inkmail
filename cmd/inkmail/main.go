@@ -79,9 +79,16 @@ func main() {
 	}
 
 	defer db.DB.Close()
-
-	fmt.Println()
-	fmt.Println("InkMail")
+	fmt.Println("▗▄▄▄▖     ▗▄▄▖       ▄▄▄      ▗▖   ▗▄ ▄▖       █  ▗▄▖")
+	fmt.Println("▐▛▀▀▘ ▐▌  ▐▛▀▜▌      ▀█▀      ▐▌   ▐█ █▌       ▀  ▝▜▌")
+	fmt.Println("▐▌   ▐███ ▐▌ ▐▌       █  ▐▙██▖▐▌▟▛ ▐███▌ ▟██▖ ██   ▐▌")
+	fmt.Println("▐███  ▐▌  ▐███        █  ▐▛ ▐▌▐▙█  ▐▌█▐▌ ▘▄▟▌  █   ▐▌")
+	fmt.Println("▐▌    ▐▌  ▐▌▝█▖       █  ▐▌ ▐▌▐▛█▖ ▐▌▀▐▌▗█▀▜▌  █   ▐▌")
+	fmt.Println("▐▌    ▐▙▄ ▐▌ ▐▌      ▄█▄ ▐▌ ▐▌▐▌▝▙ ▐▌ ▐▌▐▙▄█▌▗▄█▄▖ ▐▙▄")
+	fmt.Println("▝▘     ▀▀ ▝▘ ▝▀      ▀▀▀ ▝▘ ▝▘▝▘ ▀▘▝▘ ▝▘ ▀▀▝▘▝▀▀▀▘  ▀▀")
+	fmt.Println("======================================================")
+	fmt.Println("Welcome to the InkMail Client")
+	fmt.Println("InkMail 1.0, written by Quan Thai")
 	fmt.Printf(
 		"Identity: %s\n",
 		identity.Address(id),
@@ -201,19 +208,19 @@ func (c *Client) printHelp() {
 	fmt.Println()
 	fmt.Println("Commands:")
 	fmt.Println("  identity                 Show local identity")
-	fmt.Println("  peers [list]             List peers, aliases, status, reachability")
-	fmt.Println("  peers add <Peer ID>      Register peer (namespace::FULL-64-hex-key)")
+	fmt.Println("  peers [list]             List peers, aliases, status, and reachability")
+	fmt.Println("  peers add <Peer ID>      Register a peer using full identity key")
 	fmt.Println("  peers remove <number>    Remove a peer entry, alias and cached routes")
-	fmt.Println("  peers alias <n> <alias>  Set friendly alias (send can use it)")
+	fmt.Println("  peers alias <n> <alias>  Set friendly alias for peer")
 	fmt.Println("  relays                   Show configured Daddy relays")
 	fmt.Println("  relays probe             Measure relay latency")
 	fmt.Println("  msg [folder]             List inbox (or folder: archive, important, all)")
-	fmt.Println("  msg mv <ID> <folder>     Move a message (signed, synced to Daddy)")
-	fmt.Println("  msg del <ID>             Delete a message (signed tombstone, synced)")
-	fmt.Println("  msg sync                 Pull signed mailbox ops from Daddy")
-	fmt.Println("  open <message ID>        Open a stored message")
+	fmt.Println("  msg mv <ID> <folder>     Move a message")
+	fmt.Println("  msg del <ID>             Delete a message")
+	fmt.Println("  msg sync                 Pull signed mailbox operations from Daddy")
+	fmt.Println("  open <ID>                Open a stored message")
 	fmt.Println("  send                     Send a message")
-	fmt.Println("  help                     Show this help")
+	fmt.Println("  help                     Show this help message")
 	fmt.Println("  quit                     Exit InkMail")
 	fmt.Println()
 }
@@ -806,8 +813,4 @@ func (c *Client) sendMessageToPeer(
 	}
 
 	return nil
-}
-
-func (c *Client) printPeers() {
-	c.listPeers()
 }

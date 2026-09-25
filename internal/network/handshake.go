@@ -41,7 +41,8 @@ type handshakeHello struct {
 // transcriptBytes returns the canonical bytes that a handshake signature
 // covers. It is domain-separated and binds every field.
 func (h *handshakeHello) transcriptBytes() []byte {
-	return []byte(fmt.Sprintf(
+	return fmt.Appendf(
+		nil,
 		"%s|%d|%s|%s|%s|%s|%d",
 		handshakeLabel,
 		h.Version,
@@ -50,7 +51,7 @@ func (h *handshakeHello) transcriptBytes() []byte {
 		h.EncryptionKey,
 		h.EphemeralKey,
 		h.Timestamp,
-	))
+	)
 }
 
 // newHello builds a signed handshake message with a fresh ephemeral key.
