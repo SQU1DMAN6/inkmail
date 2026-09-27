@@ -6,6 +6,11 @@ import (
 	"time"
 )
 
+const (
+	maxHeldMessagesPerMailbox = 128
+	maxHeldMessagesTotal      = 2048
+)
+
 // OpaqueHeldMessage contains only the mailbox address, random envelope ID and
 // encrypted bytes Daddy needs for temporary delivery.
 type OpaqueHeldMessage struct {
@@ -71,7 +76,6 @@ func (d *Database) ListOpaqueOutbox(limit int) ([]OpaqueOutboxMessage, error) {
 	return messages, nil
 }
 
-// RemoveOpaqueOutbox removes an envelope accepted by all configured relays.
 func (d *Database) RemoveOpaqueOutbox(id string) error {
 	_, err := d.DB.Exec(`DELETE FROM opaque_mailbox_outbox WHERE id = ?`, id)
 	if err != nil {
@@ -92,6 +96,23 @@ func (d *Database) StoreOpaqueHeldMessage(id, mailboxID string, payload []byte, 
 	if len(payload) == 0 || expiresAt <= time.Now().Unix() {
 		return fmt.Errorf("invalid held envelope")
 	}
+
+	var mailboxCount int
+	if err := d.DB.QueryRow(`SELECT COUNT(*) FROM opaque_held_messages WHERE mailbox_id = ?`, mailboxID).Scan(&mailboxCount); err != nil {
+		return fmt.Errorf("count mailbox-held messages: %w", err)
+	}
+	if mailboxCount >= maxHeldMessagesPerMailbox {
+		return fmt.Errorf("mailbox %s reached hold quota (%d messages)", mailboxID, maxHeldMessagesPerMailbox)
+	}
+
+	var globalCount int
+	if err := d.DB.QueryRow(`SELECT COUNT(*) FROM opaque_held_messages`).Scan(&globalCount); err != nil {
+		return fmt.Errorf("count global held messages: %w", err)
+	}
+	if globalCount >= maxHeldMessagesTotal {
+		return fmt.Errorf("Daddy hold queue reached global quota (%d messages)", maxHeldMessagesTotal)
+	}
+
 	_, err := d.DB.Exec(`
 		INSERT INTO opaque_held_messages(id, mailbox_id, payload, expires_at, stored_at)
 		VALUES (?, ?, ?, ?, ?)
