@@ -8,7 +8,9 @@ package network
 // one exchange and is destroyed immediately afterwards.
 
 import (
+	"crypto/ecdh"
 	"crypto/ed25519"
+	"crypto/rand"
 	"encoding/json"
 	"fmt"
 	"net"
@@ -210,7 +212,7 @@ func recordPeer(
 	session *Session,
 	address string,
 ) {
-	if db == nil || session.Peer == nil {
+	if db == nil || session.Peer == nil || session.PeerNamespace == "relay" {
 		return
 	}
 
@@ -272,6 +274,31 @@ func Dial(
 	local *identity.Identity,
 	db PeerStore,
 ) (*Session, error) {
+	return dialWithIdentity(address, local, db, true)
+}
+
+// DialAnonymous uses a one-session identity for Daddy protocol exchanges.
+// Mailbox IDs, not cryptographic identity, authorize relay mailbox requests.
+func DialAnonymous(address string, db PeerStore) (*Session, error) {
+	publicKey, privateKey, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		return nil, fmt.Errorf("generate relay session identity: %w", err)
+	}
+	encryptionKey, err := ecdh.X25519().GenerateKey(rand.Reader)
+	if err != nil {
+		return nil, fmt.Errorf("generate relay session encryption key: %w", err)
+	}
+	local := &identity.Identity{
+		Namespace:            "relay",
+		PublicKey:            publicKey,
+		PrivateKey:           privateKey,
+		EncryptionPublicKey:  encryptionKey.PublicKey().Bytes(),
+		EncryptionPrivateKey: encryptionKey.Bytes(),
+	}
+	return dialWithIdentity(address, local, db, false)
+}
+
+func dialWithIdentity(address string, local *identity.Identity, db PeerStore, rememberPeer bool) (*Session, error) {
 	conn, err := net.DialTimeout(
 		"tcp",
 		address,
@@ -300,7 +327,9 @@ func Dial(
 		return nil, err
 	}
 
-	recordOutboundPeer(db, session)
+	if rememberPeer {
+		recordOutboundPeer(db, session)
+	}
 
 	return session, nil
 }

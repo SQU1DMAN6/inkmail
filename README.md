@@ -1,6 +1,6 @@
 # FtR InkMail
 
-**Current Release**: FtR InkMail 1.0.0, September 2026
+**Current Release**: FtR InkMail 1.0.1, September 2026
 
 ## Things to read
 
@@ -18,7 +18,7 @@ This project is not a web app or a social network. It is a command-line mail cli
 
 - each user has an Ed25519 identity key,
 - each message is signed and then encrypted for the recipient,
-- relays and Daddy nodes only see encrypted payloads and routing metadata,
+- Daddies route opaque encrypted envelopes by random mailbox ID,
 - the local node keeps a durable mailbox and peer list.
 
 The actual command-line interface is the `inkmail` client. A separate daemon, `inkmaild`, listens for incoming ghost-network traffic and keeps a persistent connection to configured relay endpoints.
@@ -32,7 +32,7 @@ InkMail maintains a local mailbox with a user identity, a peer directory, and a 
 3. send a signed and encrypted message,
 4. let the network attempt direct delivery first,
 5. fall back to Daddy/relay hold-and-forward if direct delivery fails,
-6. sync mailbox operations so move/delete state converges across devices.
+6. fetch held envelopes and encrypted delivery receipts from configured Daddies.
 
 The local database stores messages in folders such as `inbox`, `archive`, and `important`, plus a separate queue for outgoing items waiting for acknowledgement.
 
@@ -59,7 +59,10 @@ You may also pass a custom data directory and user namespace:
 ./build/inkmail --data ~/.inkmail --user alice
 ```
 
-On first launch, InkMail generates a private Ed25519 identity and a separate X25519 encryption keypair. It prints the identity address and then drops you into the REPL shell:
+On first launch, InkMail generates a private Ed25519 identity, a separate X25519
+encryption keypair, and a random 256-bit mailbox ID. `identity` prints a contact
+bundle that you share privately with peers; the mailbox ID is a bearer address,
+so treat it like a secret.
 
 ```text
 inkmail>
@@ -83,7 +86,7 @@ This prints:
 
 - your short identity address,
 - your full identity string,
-- the local namespace and public key information.
+- the contact bundle (`namespace::Ed25519-key::X25519-key::mailbox-ID`).
 
 ### List peers
 
@@ -97,25 +100,27 @@ You can also request explicit subcommands:
 
 ```text
 peers list
-peers add <namespace::full-public-key-hex>
+peers add <namespace::ed25519-key::x25519-key::mailbox-id>
 peers remove <number>
 peers alias <number> <alias>
 ```
 
-A peer ID must be the full public key, not a short fingerprint. The project intentionally rejects short fingerprints for `peers add` because the code requires the full key for verification and encryption.
+New contacts need both full public keys and the recipient's opaque mailbox ID.
+Identity-only v1.0.0 peer entries cannot be used for private relay delivery
+until the contact bundle is re-imported.
 
 ### Add a peer
 
-When you know another user's identity, add it like this:
+After the other user shares the bundle printed by `identity`, add it like this:
 
 ```text
-peers add alice::0123abcd...
+peers add alice::<ed25519-key>::<x25519-key>::<mailbox-id>
 ```
 
-The value is expected to be:
+The value contains:
 
 ```text
-<namespace>::<full-ed25519-public-key-hex>
+<namespace>::<full-ed25519-public-key-hex>::<full-x25519-public-key-hex>::<random-256-bit-mailbox-id>
 ```
 
 If you want a friendlier label, set an alias:
@@ -163,16 +168,19 @@ Hi there.
 Sending message...
 ```
 
-The message is created, saved locally as queued, and then sent through the resolved network path.
+The message is first saved locally as `queued`. If a Daddy accepts it, its
+state becomes `pending` until the recipient stores the message and returns a
+signed delivery receipt; the sender then shows `delivered`. A direct delivery
+is shown as `delivered` as soon as the recipient acknowledges it.
 
 ### List messages and folders
 
-The mailbox is organized into folders:
+The local mailbox is organized into folders:
 
 - `inbox` (default when you run `msg`)
 - `archive`
 - `important`
-- `deleted`
+- `deleted` (messages moved here remain stored locally)
 
 Display the current mailbox:
 
@@ -209,17 +217,24 @@ Delete a message:
 msg del <message-id>
 ```
 
-These operations are signed with your identity and then replicated to Daddy/relays so the mailbox state can converge across devices.
+Both operations are local-only. `msg mv` changes only this device's folder;
+moving a message to `deleted` is still reversible. `msg del` permanently
+removes the local message row and securely checkpoints SQLite. Neither command
+contacts Daddy, creates a sync operation, or affects another device. A message
+already accepted by Daddy cannot currently be withdrawn remotely.
 
 ### Sync mailbox state
 
-Mailbox operations are synchronized from Daddy. To pull any newer signed operations:
+`msg sync` polls each configured Daddy for opaque held envelopes and retries
+any encrypted delivery receipts still in the local outbox:
 
 ```text
 msg sync
 ```
 
-This updates the local mailbox watermark and reapplies valid move/delete operations for your own messages.
+Incoming receipts are encrypted mailbox messages. The sender verifies the
+recipient-signed inner message and changes a matching `pending` message to
+`delivered`.
 
 ### Relay status and probing
 
@@ -241,12 +256,13 @@ This shows each relay address and its measured round-trip time in milliseconds. 
 
 InkMail attempts to deliver messages in this order:
 
-1. use a cached or discovered route for the recipient,
+1. use a cached direct route or look up the recipient's opaque mailbox ID,
 2. dial the recipient directly over the ghost network,
-3. if direct delivery is not possible, send the encrypted envelope to Daddy or a configured relay,
+3. if direct delivery is not possible, send a padded opaque mailbox envelope to a configured Daddy,
 4. rely on Daddy to hold the message until the recipient fetches it.
 
-This means the client can continue working when IP addresses change or when either side is behind NAT. The route registration is time-limited, and stale routes are replaced by newer registrations.
+Daddy routes mailbox IDs to temporary addresses and holds ciphertext only.
+Routes expire; stale registrations are replaced when refreshed.
 
 ## relays.conf and relay configuration
 
@@ -277,7 +293,9 @@ The code also honours `INKMAIL_DADDY` for compatibility and `INKMAIL_DATA_DIR` f
 
 ## Running the daemon
 
-The daemon listens for inbound ghost-network connections and maintains persistent connectivity to your configured relay node.
+The daemon listens for inbound ghost-network connections and periodically
+registers the local opaque mailbox route, retries encrypted control envelopes,
+and polls configured relays.
 
 Example:
 
@@ -291,7 +309,9 @@ If you want to disable the default Daddy fallback, pass an empty value:
 ./build/inkmaild --data ~/.inkmail --port 25565 --daddy ""
 ```
 
-The daemon logs the identity, the relay list, and the listening port. It is intended to be the background service that receives at the network layer while the CLI remains the interactive user interface.
+The daemon logs its local identity, configured relay addresses, and listening
+port. Daddy-facing sessions use one-session relay identities rather than the
+local cryptographic identity.
 
 ## Security and trust model
 
@@ -300,17 +320,35 @@ InkMail’s model is based on layered security:
 - identity keys are Ed25519 signatures that attest to who sent a message,
 - message content is encrypted with X25519-derived keys before it leaves the sender,
 - the transport layer also performs encrypted sessions after a signed handshake,
-- relays and Daddy only receive encrypted content and routing metadata, not your plaintext.
+- Daddy stores only an opaque mailbox ID, random envelope ID, ciphertext, and an expiry while delivery is active.
 
 The project explicitly validates:
 
 - peer namespaces and public keys,
 - message and encrypted-envelope signatures,
-- recipient identities,
+- recipient identities after the envelope is decrypted locally,
 - route TTLs,
-- mailbox operation author ownership.
+- recipient-signed message envelopes and encrypted delivery receipts.
 
-This reduces the risk of spoofed identities, forged mail, or route poisoning.
+### Relay-visible metadata
+
+For hold-and-forward traffic, Daddy can see the opaque mailbox ID, a random
+per-envelope ID, ciphertext length class, temporary advertised route address,
+and connection timing/IP metadata. It does not receive sender/recipient
+namespaces, Ed25519/X25519 public keys, subject, body, inner message ID, or
+delivery receipt contents in the mailbox request or held row. The mailbox ID
+is stable and therefore linkable across messages to the same mailbox; it is a
+bearer token, not an anonymity system. Fixed 64 KiB encrypted plaintext size
+classes reduce exact-size leakage, but frame encoding and transport timing
+still reveal approximate size and activity. Direct peers still authenticate
+one another by cryptographic identity. This is not Tor-level anonymity and
+does not defeat traffic analysis.
+
+Protocol v3 is intentionally incompatible with v2 because Daddy's wire
+addressing and envelope formats changed. Peers must exchange a fresh contact
+bundle. A database with v2 held messages fails startup with a drain-before-
+upgrade error rather than silently discarding or retaining identity-bearing
+relay records.
 
 ## Practical usage notes
 
@@ -324,7 +362,7 @@ Then inside the client:
 
 ```text
 identity
-peers add bob::<full-public-key>
+peers add bob::<ed25519-key>::<x25519-key>::<mailbox-id>
 peers alias 1 bob
 send
 msg
@@ -335,7 +373,7 @@ For long-lived operation, run the daemon in a separate terminal or as a service,
 
 ## Troubleshooting
 
-- If `peers add` fails, check that you used the full public key and the correct `namespace::public-key` syntax.
+- If `peers add` fails, check that you included both full public keys and the opaque mailbox ID from the contact bundle.
 - If delivery is slow or fails, run `relays probe` to check connectivity.
 - If you have no peer routes yet, use `peers` to confirm identity records are present before sending.
 - If a message is still queued, it means the client accepted it locally but did not yet get a direct or relayed acknowledgement.

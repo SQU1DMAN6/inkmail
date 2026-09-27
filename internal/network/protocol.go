@@ -32,11 +32,11 @@ const (
 	// maxFrameSize bounds a single protocol frame (SPEC section 42).
 	maxFrameSize = 4 * 1024 * 1024
 
-	// protocolVersion is the InkMail v2 protocol revision.
-	protocolVersion = 2
+	// protocolVersion 3 adds opaque mailbox envelopes and mailbox routes.
+	protocolVersion = 3
 
 	// handshakeLabel domain-separates handshake signatures.
-	handshakeLabel = "inkmail-hello-v2"
+	handshakeLabel = "inkmail-hello-v3"
 
 	// sessionLabelInitiator / sessionLabelResponder domain-separate the
 	// directional transport keys derived during the handshake.
@@ -119,12 +119,7 @@ const (
 	messageTypeFetchMessages    = "FETCH_MESSAGES"
 	messageTypeDelivery         = "MESSAGE_DELIVERY"
 	messageTypeDeliveryAck      = "DELIVERY_ACK"
-	messageTypeDeleteMessage    = "DELETE_MESSAGE"
 	messageTypeDeleteAck        = "DELETE_ACK"
-	messageTypeMailboxOp        = "MAILBOX_OP"
-	messageTypeMailboxOpAck     = "MAILBOX_OP_ACK"
-	messageTypeMailboxSync      = "MAILBOX_SYNC"
-	messageTypeMailboxState     = "MAILBOX_STATE"
 	messageTypeRelayProbe       = "RELAY_PROBE"
 	messageTypeRelayProbeAck    = "RELAY_PROBE_ACK"
 	messageTypeGhostForward     = "GHOST_FORWARD"

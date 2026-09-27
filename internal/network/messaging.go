@@ -1,23 +1,14 @@
 package network
 
-// messaging.go implements the protocol dispatcher and the two delivery
-// strategies used by ghost connections:
-//
-//   - direct delivery: an encrypted envelope is handed straight to the
-//     recipient over a temporary connection
-//   - hold-and-forward: the envelope is handed to Daddy for later delivery
-//
-// In both cases Daddy and any relay only ever see ciphertext because the
-// subject and body are encrypted end-to-end before they leave the sender
-// (SPEC sections 16, 17 and 43).
-
 import (
+	"crypto/ed25519"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"net"
+	"strings"
 	"time"
 
 	"github.com/SQU1DMAN6/inkmail/internal/database"
@@ -25,11 +16,6 @@ import (
 	"github.com/SQU1DMAN6/inkmail/internal/message"
 )
 
-// HandleConnection completes the handshake on an inbound connection and
-// serves exactly one protocol request before closing.
-//
-// The connection is temporary: it is never retained and never becomes a
-// user-managed session.
 func HandleConnection(
 	conn net.Conn,
 	local *identity.Identity,
@@ -45,8 +31,6 @@ func HandleConnection(
 	return serveSession(session, local, db)
 }
 
-// acceptSession performs the responder side of the handshake and records the
-// now-authenticated peer.
 func acceptSession(
 	conn net.Conn,
 	local *identity.Identity,
@@ -67,8 +51,6 @@ func acceptSession(
 		return nil, err
 	}
 
-	// The peer address is what the peer's ghost connection came from. It is
-	// a usable direct route for the lifetime of the route TTL.
 	address := ""
 
 	if conn.RemoteAddr() != nil {
@@ -80,13 +62,6 @@ func acceptSession(
 	return session, nil
 }
 
-// serveSession reads requests until the peer closes the connection and
-// dispatches each of them to the correct handler.
-//
-// A ghost connection is normally single-exchange, but hold-and-forward needs
-// two: FETCH_MESSAGES is answered with MESSAGE_DELIVERY and each delivered
-// envelope is then acknowledged with DELIVERY_ACK. The loop is bounded so a
-// peer cannot keep a temporary connection alive indefinitely.
 func serveSession(
 	session *Session,
 	local *identity.Identity,
@@ -96,8 +71,6 @@ func serveSession(
 		var request Message
 
 		if err := receiveMessage(session, &request); err != nil {
-			// The peer closing the connection after its final
-			// acknowledgement is the normal end of a ghost connection.
 			if errors.Is(err, io.EOF) ||
 				errors.Is(err, net.ErrClosed) {
 				return nil
@@ -133,7 +106,6 @@ func serveSession(
 	)
 }
 
-// dispatchRequest routes one validated protocol request to its handler.
 func dispatchRequest(
 	session *Session,
 	local *identity.Identity,
@@ -159,17 +131,8 @@ func dispatchRequest(
 	case messageTypeLookupRoute:
 		return handleLookupRoute(session, db, request.Data)
 
-	case messageTypeDeleteMessage:
-		return handleDeleteMessage(session, db, request.Data)
-
-	case messageTypeMailboxOp:
-		return handleMailboxOp(session, db, request.Data)
-
-	case messageTypeMailboxSync:
-		return handleMailboxSync(session, db, request.Data)
-
 	case messageTypeRelayProbe:
-		return handleRelayProbe(session, local, db, request.Data)
+		return handleRelayProbe(session, request.Data)
 
 	case messageTypeGhostForward:
 		return handleGhostForward(session, local, db, request.Data)
@@ -182,15 +145,13 @@ func dispatchRequest(
 	}
 }
 
-// handleIncomingMessage receives a direct end-to-end encrypted envelope,
-// verifies it, stores it and acknowledges delivery.
 func handleIncomingMessage(
 	session *Session,
 	local *identity.Identity,
 	db *database.Database,
 	data []byte,
 ) error {
-	var envelope message.EncryptedMessage
+	var envelope message.MailboxEnvelope
 
 	if err := json.Unmarshal(data, &envelope); err != nil {
 		_ = sendMessage(session, Message{
@@ -210,23 +171,12 @@ func handleIncomingMessage(
 
 	status := statusDelivered
 	reason := ""
-
-	switch {
-	case envelope.RecipientPublicKey !=
-		hex.EncodeToString(local.PublicKey):
-
+	if err := envelope.Validate(); err != nil {
 		status = statusRejected
-		reason = "recipient mismatch"
-
-	default:
-		if err := receiveEncryptedEnvelope(
-			db,
-			local,
-			envelope,
-		); err != nil {
-			status = statusRejected
-			reason = err.Error()
-		}
+		reason = err.Error()
+	} else if err := receiveMailboxEnvelope(db, local, envelope); err != nil {
+		status = statusRejected
+		reason = err.Error()
 	}
 
 	return sendMessage(session, Message{
@@ -239,44 +189,38 @@ func handleIncomingMessage(
 	})
 }
 
-// receiveEncryptedEnvelope verifies and stores an end-to-end encrypted
-// message. Verification happens before decryption (SPEC section 19).
+func decryptEncryptedEnvelope(
+	local *identity.Identity,
+	envelope message.EncryptedMessage,
+) (*message.Message, error) {
+	if err := envelope.Verify(); err != nil {
+		return nil, fmt.Errorf("signature verification failed: %w", err)
+	}
+	decrypted, err := envelope.DecryptFromSender(local.EncryptionPrivateKey, local.Namespace)
+	if err != nil {
+		return nil, fmt.Errorf("decrypt message: %w", err)
+	}
+	if decrypted.ID != envelope.ID {
+		return nil, fmt.Errorf("message ID mismatch")
+	}
+	if err := decrypted.VerifyID(); err != nil {
+		return nil, fmt.Errorf("message ID verification failed: %w", err)
+	}
+	if decrypted.RecipientNamespace != local.Namespace ||
+		!strings.EqualFold(decrypted.RecipientPublicKey, hex.EncodeToString(local.PublicKey)) {
+		return nil, fmt.Errorf("recipient identity mismatch")
+	}
+	return decrypted, nil
+}
+
 func receiveEncryptedEnvelope(
 	db *database.Database,
 	local *identity.Identity,
 	envelope message.EncryptedMessage,
 ) error {
-	if err := envelope.Verify(); err != nil {
-		return fmt.Errorf(
-			"signature verification failed: %w",
-			err,
-		)
-	}
-
-	decrypted, err := envelope.DecryptFromSender(
-		local.EncryptionPrivateKey,
-		local.Namespace,
-	)
+	decrypted, err := decryptEncryptedEnvelope(local, envelope)
 	if err != nil {
-		return fmt.Errorf(
-			"decrypt message: %w",
-			err,
-		)
-	}
-
-	if decrypted.ID != envelope.ID {
-		return fmt.Errorf(
-			"message ID mismatch",
-		)
-	}
-
-	// The ID is derived from stable message content, so only the legitimate
-	// recipient can recompute it (SPEC section 20).
-	if err := decrypted.VerifyID(); err != nil {
-		return fmt.Errorf(
-			"message ID verification failed: %w",
-			err,
-		)
+		return err
 	}
 
 	senderKey, err := decodeHexField(envelope.SenderPublicKey)
@@ -284,9 +228,6 @@ func receiveEncryptedEnvelope(
 		return err
 	}
 
-	// Rebuild the plaintext message and persist it locally. The stored
-	// representation is the decrypted form because this node is the
-	// legitimate recipient.
 	stored := &message.Message{
 		ID:                 decrypted.ID,
 		SenderNamespace:    envelope.SenderNamespace,
@@ -313,9 +254,104 @@ func receiveEncryptedEnvelope(
 	return nil
 }
 
+const deliveryReceiptSubject = "InkMail internal delivery receipt v3"
+
+type deliveryReceiptContent struct {
+	MessageID string `json:"message_id"`
+}
+
+func receiveMailboxEnvelope(
+	db *database.Database,
+	local *identity.Identity,
+	envelope message.MailboxEnvelope,
+) error {
+	mailboxID, err := db.GetOrCreateMailboxID()
+	if err != nil {
+		return err
+	}
+	payload, err := envelope.Open(local.EncryptionPrivateKey, mailboxID)
+	if err != nil {
+		return err
+	}
+	decrypted, err := decryptEncryptedEnvelope(local, payload.Envelope)
+	if err != nil {
+		return err
+	}
+	if payload.Kind == "delivery_receipt" {
+		var receipt deliveryReceiptContent
+		if err := json.Unmarshal([]byte(decrypted.Body), &receipt); err != nil || strings.TrimSpace(receipt.MessageID) == "" {
+			return fmt.Errorf("invalid delivery receipt")
+		}
+		recipientKey, err := decodeHexField(decrypted.SenderPublicKey)
+		if err != nil {
+			return err
+		}
+		_, err = db.MarkMessageDeliveredFromReceipt(
+			receipt.MessageID,
+			local.Namespace,
+			local.PublicKey,
+			decrypted.SenderNamespace,
+			recipientKey,
+		)
+		return err
+	}
+
+	if err := receiveEncryptedEnvelope(db, local, payload.Envelope); err != nil {
+		return err
+	}
+	senderKey, err := decodeHexField(decrypted.SenderPublicKey)
+	if err != nil {
+		return err
+	}
+	senderEncryptionKey, err := decodeHexField(payload.SenderEncryptionKey)
+	if err != nil {
+		return err
+	}
+	if err := db.RecordPeerContact(decrypted.SenderNamespace, senderKey,
+		senderEncryptionKey, payload.SenderMailboxID); err != nil {
+		return err
+	}
+	return sendDeliveryReceiptToRelays(db, local, decrypted, payload, senderKey, senderEncryptionKey)
+}
+
+func sendDeliveryReceiptToRelays(
+	db *database.Database,
+	local *identity.Identity,
+	original *message.Message,
+	payload *message.MailboxPayload,
+	senderKey []byte,
+	senderEncryptionKey []byte,
+) error {
+	receiptBody, err := json.Marshal(deliveryReceiptContent{MessageID: original.ID})
+	if err != nil {
+		return err
+	}
+	receiptMessage, err := message.New(local, original.SenderNamespace,
+		ed25519.PublicKey(senderKey), deliveryReceiptSubject, string(receiptBody))
+	if err != nil {
+		return err
+	}
+	inner, err := receiptMessage.EncryptForRecipient(senderEncryptionKey,
+		original.SenderNamespace, local.PrivateKey)
+	if err != nil {
+		return err
+	}
+	localMailboxID, err := db.GetOrCreateMailboxID()
+	if err != nil {
+		return err
+	}
+	outer, err := message.WrapDeliveryReceipt(*inner, payload.SenderMailboxID,
+		localMailboxID, local.EncryptionPublicKey, senderEncryptionKey)
+	if err != nil {
+		return err
+	}
+	return queueAndSendOpaqueEnvelope(db, local, outer)
+}
+
 // ackBody is the shared body of every acknowledgement message.
 type ackBody struct {
 	MessageID string `json:"message_id,omitempty"`
+	MailboxID string `json:"mailbox_id,omitempty"`
 	Status    string `json:"status"`
 	Reason    string `json:"reason,omitempty"`
 }
@@ -359,25 +395,4 @@ func sendAck(
 			Reason:    reason,
 		}),
 	})
-}
-
-// deliverEnvelopeLocally verifies, decrypts and stores one envelope that was
-// delivered by Daddy, and reports the status Daddy needs (SPEC section 24).
-//
-// A rejected envelope is deliberately not deleted on Daddy's side: it is
-// retried until its expiry is reached (SPEC section 25).
-func deliverEnvelopeLocally(
-	db *database.Database,
-	local *identity.Identity,
-	envelope message.EncryptedMessage,
-) (string, string) {
-	if err := receiveEncryptedEnvelope(
-		db,
-		local,
-		envelope,
-	); err != nil {
-		return statusRejected, err.Error()
-	}
-
-	return statusDelivered, ""
 }

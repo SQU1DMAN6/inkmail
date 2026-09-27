@@ -99,13 +99,14 @@ func (d *Database) GetPeerByAlias(alias string) (*PeerIdentity, error) {
 	var peer PeerIdentity
 	var encryptionKey []byte
 	err := d.DB.QueryRow(`
-		SELECT namespace, public_key, encryption_public_key, alias, first_seen, last_seen
+		SELECT namespace, public_key, encryption_public_key, mailbox_id, alias, first_seen, last_seen
 		FROM peer_identities
 		WHERE alias = ? COLLATE NOCASE
 	`, alias).Scan(
 		&peer.Namespace,
 		&peer.PublicKey,
 		&encryptionKey,
+		&peer.MailboxID,
 		&peer.Alias,
 		&peer.FirstSeen,
 		&peer.LastSeen,

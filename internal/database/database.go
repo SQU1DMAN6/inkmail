@@ -1,7 +1,9 @@
 package database
 
 import (
+	"crypto/rand"
 	"database/sql"
+	"encoding/hex"
 	"fmt"
 	"strings"
 	"time"
@@ -9,14 +11,6 @@ import (
 	_ "modernc.org/sqlite"
 
 	"github.com/SQU1DMAN6/inkmail/internal/message"
-)
-
-// MailboxOpKind enumerates the signed mailbox mutations a device may issue
-// for one of its own messages. Ops are replicated to Daddy so every device
-// converges, but only the message owner may author them.
-const (
-	MailboxOpMove   = "move"
-	MailboxOpDelete = "delete"
 )
 
 // Reserved mailbox folders. "inbox" is the default view; "archive" and
@@ -28,22 +22,6 @@ const (
 	FolderImportant = "important"
 	FolderDeleted   = "deleted"
 )
-
-// MailboxOp is one signed move/delete mutation for a single message.
-type MailboxOp struct {
-	MessageID    string
-	Op           string
-	Folder       string
-	SenderNS     string
-	SenderKey    []byte
-	RecipientNS  string
-	RecipientKey []byte
-	AuthorNS     string
-	AuthorKey    []byte
-	Timestamp    int64
-	Signature    []byte
-	SubmittedAt  int64
-}
 
 type Database struct {
 	DB *sql.DB
@@ -72,6 +50,12 @@ const (
 	DirectionSent     = "sent"
 	DirectionQueued   = "queued"
 	DirectionReceived = "received"
+)
+
+const (
+	StatusQueued    = "queued"
+	StatusPending   = "pending"
+	StatusDelivered = "delivered"
 )
 
 // Legacy directions rewritten by the migration below.
@@ -119,6 +103,7 @@ func (d *Database) init() error {
 	schema := `
 	PRAGMA journal_mode = WAL;
 	PRAGMA foreign_keys = ON;
+	PRAGMA secure_delete = ON;
 
 	CREATE TABLE IF NOT EXISTS node_meta (
 		key TEXT PRIMARY KEY,
@@ -129,6 +114,7 @@ func (d *Database) init() error {
 		namespace TEXT NOT NULL,
 		public_key BLOB NOT NULL,
 		encryption_public_key BLOB,
+		mailbox_id TEXT NOT NULL DEFAULT '',
 		alias TEXT NOT NULL DEFAULT '',
 		first_seen INTEGER NOT NULL,
 		last_seen INTEGER NOT NULL,
@@ -157,6 +143,16 @@ func (d *Database) init() error {
 		idx_peer_routes_expiry
 	ON peer_routes(expires_at);
 
+	CREATE TABLE IF NOT EXISTS mailbox_routes (
+		mailbox_id TEXT PRIMARY KEY,
+		address TEXT NOT NULL,
+		expires_at INTEGER NOT NULL,
+		last_seen INTEGER NOT NULL
+	);
+
+	CREATE INDEX IF NOT EXISTS idx_mailbox_routes_expiry
+	ON mailbox_routes(expires_at);
+
 	CREATE TABLE IF NOT EXISTS messages (
 		id TEXT PRIMARY KEY,
 		sender_namespace TEXT NOT NULL,
@@ -175,26 +171,6 @@ func (d *Database) init() error {
 		stored_at INTEGER NOT NULL
 	);
 
-	CREATE TABLE IF NOT EXISTS mailbox_ops (
-		message_id TEXT NOT NULL,
-		op TEXT NOT NULL,
-		folder TEXT NOT NULL DEFAULT '',
-		sender_namespace TEXT NOT NULL DEFAULT '',
-		sender_public_key BLOB NOT NULL DEFAULT X'',
-		recipient_namespace TEXT NOT NULL DEFAULT '',
-		recipient_public_key BLOB NOT NULL DEFAULT X'',
-		author_namespace TEXT NOT NULL,
-		author_public_key BLOB NOT NULL,
-		timestamp INTEGER NOT NULL,
-		signature BLOB NOT NULL,
-		submitted_at INTEGER NOT NULL,
-		PRIMARY KEY(message_id, op, timestamp, author_public_key)
-	);
-
-	CREATE INDEX IF NOT EXISTS
-		idx_mailbox_ops_message
-	ON mailbox_ops(message_id);
-
 	CREATE INDEX IF NOT EXISTS
 		idx_messages_created_at
 	ON messages(created_at DESC);
@@ -203,31 +179,27 @@ func (d *Database) init() error {
 		idx_messages_direction
 	ON messages(direction);
 
-	CREATE TABLE IF NOT EXISTS held_messages (
+	CREATE TABLE IF NOT EXISTS opaque_held_messages (
 		id TEXT PRIMARY KEY,
-		sender_namespace TEXT NOT NULL,
-		sender_public_key BLOB NOT NULL,
-		recipient_namespace TEXT NOT NULL,
-		recipient_public_key BLOB NOT NULL,
+		mailbox_id TEXT NOT NULL,
 		payload BLOB NOT NULL,
-		created_at INTEGER NOT NULL,
 		expires_at INTEGER NOT NULL,
 		stored_at INTEGER NOT NULL
 	);
 
-	CREATE INDEX IF NOT EXISTS
-		idx_held_messages_expires_at
-	ON held_messages(expires_at);
+	CREATE INDEX IF NOT EXISTS idx_opaque_held_mailbox
+	ON opaque_held_messages(mailbox_id, stored_at);
 
-	CREATE TABLE IF NOT EXISTS mailbox_messages (
+	CREATE INDEX IF NOT EXISTS idx_opaque_held_expiry
+	ON opaque_held_messages(expires_at);
+
+	CREATE TABLE IF NOT EXISTS opaque_mailbox_outbox (
 		id TEXT PRIMARY KEY,
-		sender_namespace TEXT NOT NULL,
-		sender_public_key BLOB NOT NULL,
-		recipient_namespace TEXT NOT NULL,
-		recipient_public_key BLOB NOT NULL,
-		created_at INTEGER NOT NULL,
+		mailbox_id TEXT NOT NULL,
+		payload BLOB NOT NULL,
 		stored_at INTEGER NOT NULL
 	);
+
 	`
 
 	if _, err := d.DB.Exec(schema); err != nil {
@@ -240,8 +212,46 @@ func (d *Database) init() error {
 	if err := d.migrate(); err != nil {
 		return err
 	}
+	if _, err := d.GetOrCreateMailboxID(); err != nil {
+		return err
+	}
 
 	return nil
+}
+
+// GetOrCreateMailboxID returns this node's persistent, random mailbox address.
+func (d *Database) GetOrCreateMailboxID() (string, error) {
+	var mailboxID string
+	err := d.DB.QueryRow(`SELECT value FROM node_meta WHERE key = 'mailbox_id'`).Scan(&mailboxID)
+	if err == nil {
+		decoded, decodeErr := hex.DecodeString(mailboxID)
+		if decodeErr != nil || len(decoded) != 32 {
+			return "", fmt.Errorf("stored mailbox identifier is invalid")
+		}
+		return mailboxID, nil
+	}
+	if err != sql.ErrNoRows {
+		return "", fmt.Errorf("read mailbox identifier: %w", err)
+	}
+	randomID := make([]byte, 32)
+	if _, err := rand.Read(randomID); err != nil {
+		return "", fmt.Errorf("generate mailbox identifier: %w", err)
+	}
+	mailboxID = hex.EncodeToString(randomID)
+	if _, err := d.DB.Exec(`
+		INSERT INTO node_meta(key, value) VALUES ('mailbox_id', ?)
+		ON CONFLICT(key) DO NOTHING
+	`, mailboxID); err != nil {
+		return "", fmt.Errorf("store mailbox identifier: %w", err)
+	}
+	if err := d.DB.QueryRow(`SELECT value FROM node_meta WHERE key = 'mailbox_id'`).Scan(&mailboxID); err != nil {
+		return "", fmt.Errorf("read mailbox identifier: %w", err)
+	}
+	decoded, err := hex.DecodeString(mailboxID)
+	if err != nil || len(decoded) != 32 {
+		return "", fmt.Errorf("stored mailbox identifier is invalid")
+	}
+	return mailboxID, nil
 }
 
 // migrate applies additive schema upgrades to databases created by
@@ -252,20 +262,14 @@ func (d *Database) migrate() error {
 		 ADD COLUMN encryption_public_key BLOB`,
 		`ALTER TABLE peer_identities
 		 ADD COLUMN alias TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE peer_identities
+		 ADD COLUMN mailbox_id TEXT NOT NULL DEFAULT ''`,
 		`ALTER TABLE messages
 		 ADD COLUMN folder TEXT NOT NULL DEFAULT 'inbox'`,
 		`ALTER TABLE messages
 		 ADD COLUMN folder_updated_at INTEGER NOT NULL DEFAULT 0`,
 		`ALTER TABLE messages
 		 ADD COLUMN folder_updated_signature BLOB NOT NULL DEFAULT X''`,
-		`ALTER TABLE mailbox_ops
-		 ADD COLUMN sender_namespace TEXT NOT NULL DEFAULT ''`,
-		`ALTER TABLE mailbox_ops
-		 ADD COLUMN sender_public_key BLOB NOT NULL DEFAULT X''`,
-		`ALTER TABLE mailbox_ops
-		 ADD COLUMN recipient_namespace TEXT NOT NULL DEFAULT ''`,
-		`ALTER TABLE mailbox_ops
-		 ADD COLUMN recipient_public_key BLOB NOT NULL DEFAULT X''`,
 	}
 
 	for _, statement := range migrations {
@@ -279,6 +283,54 @@ func (d *Database) migrate() error {
 				err,
 			)
 		}
+	}
+
+	if _, err := d.DB.Exec(`
+		UPDATE messages
+		SET direction = ?, status = ?
+		WHERE direction = ? AND status = 'sent'
+	`, DirectionSent, StatusPending, DirectionQueued); err != nil {
+		return fmt.Errorf("migrate outgoing message state: %w", err)
+	}
+
+	var legacyHoldTable int
+	if err := d.DB.QueryRow(`
+		SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'held_messages'
+	`).Scan(&legacyHoldTable); err != nil {
+		return fmt.Errorf("check legacy relay storage: %w", err)
+	}
+	if legacyHoldTable > 0 {
+		var pending int
+		if err := d.DB.QueryRow(`SELECT COUNT(*) FROM held_messages`).Scan(&pending); err != nil {
+			return fmt.Errorf("count legacy held messages: %w", err)
+		}
+		if pending > 0 {
+			return fmt.Errorf("upgrade blocked: %d v2 Daddy-held message(s) still contain identity metadata; run the previous InkMail daemon to deliver them before upgrading", pending)
+		}
+		if _, err := d.DB.Exec(`DROP TABLE held_messages`); err != nil {
+			return fmt.Errorf("remove empty legacy relay storage: %w", err)
+		}
+	}
+
+	var cleanupDone string
+	cleanupErr := d.DB.QueryRow(`SELECT value FROM node_meta WHERE key = 'v3_privacy_cleanup'`).Scan(&cleanupDone)
+	if cleanupErr == sql.ErrNoRows {
+		for _, table := range []string{"mailbox_ops", "mailbox_messages", "delivery_receipts", "delivery_receipt_outbox"} {
+			if _, err := d.DB.Exec(`DROP TABLE IF EXISTS ` + table); err != nil {
+				return fmt.Errorf("purge legacy relay metadata: %w", err)
+			}
+		}
+		if _, err := d.DB.Exec(`DELETE FROM peer_routes`); err != nil {
+			return fmt.Errorf("purge identity-keyed relay routes: %w", err)
+		}
+		if _, err := d.DB.Exec(`
+			INSERT INTO node_meta(key, value) VALUES ('v3_privacy_cleanup', '1')
+			ON CONFLICT(key) DO UPDATE SET value = excluded.value
+		`); err != nil {
+			return fmt.Errorf("record privacy migration: %w", err)
+		}
+	} else if cleanupErr != nil {
+		return fmt.Errorf("check privacy migration: %w", cleanupErr)
 	}
 
 	// Case-insensitive alias uniqueness for databases created before the
@@ -442,6 +494,38 @@ func (d *Database) RecordPeerIdentityWithKey(
 	return nil
 }
 
+// RecordPeerContact stores a complete contact bundle with its opaque mailbox
+// address and public encryption key.
+func (d *Database) RecordPeerContact(
+	namespace string,
+	publicKey []byte,
+	encryptionPublicKey []byte,
+	mailboxID string,
+) error {
+	decoded, err := hex.DecodeString(mailboxID)
+	if err != nil || len(decoded) != 32 {
+		return fmt.Errorf("invalid peer mailbox identifier")
+	}
+	if len(publicKey) != 32 || len(encryptionPublicKey) != 32 {
+		return fmt.Errorf("invalid peer public key size")
+	}
+	now := time.Now().Unix()
+	_, err = d.DB.Exec(`
+		INSERT INTO peer_identities(
+			namespace, public_key, encryption_public_key, mailbox_id,
+			alias, first_seen, last_seen
+		) VALUES (?, ?, ?, ?, '', ?, ?)
+		ON CONFLICT(namespace, public_key) DO UPDATE SET
+			encryption_public_key = excluded.encryption_public_key,
+			mailbox_id = excluded.mailbox_id,
+			last_seen = excluded.last_seen
+	`, namespace, publicKey, encryptionPublicKey, mailboxID, now, now)
+	if err != nil {
+		return fmt.Errorf("record peer contact: %w", err)
+	}
+	return nil
+}
+
 // ListPeerIdentities returns all known peer identities
 // ordered by namespace, public_key for deterministic results
 func (d *Database) ListPeerIdentities() ([]PeerIdentity, error) {
@@ -450,6 +534,7 @@ func (d *Database) ListPeerIdentities() ([]PeerIdentity, error) {
 			namespace,
 			public_key,
 			encryption_public_key,
+			mailbox_id,
 			alias,
 			first_seen,
 			last_seen
@@ -473,6 +558,7 @@ func (d *Database) ListPeerIdentities() ([]PeerIdentity, error) {
 			&peer.Namespace,
 			&peer.PublicKey,
 			&encryptionKey,
+			&peer.MailboxID,
 			&peer.Alias,
 			&peer.FirstSeen,
 			&peer.LastSeen,
@@ -545,6 +631,7 @@ type PeerIdentity struct {
 	Namespace           string
 	PublicKey           []byte
 	EncryptionPublicKey []byte
+	MailboxID           string
 	Alias               string
 	FirstSeen           int64
 	LastSeen            int64
@@ -609,7 +696,14 @@ func (d *Database) StoreMessage(
 		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT(id)
 		DO UPDATE SET
-			status = excluded.status
+			direction = CASE
+				WHEN messages.direction = ? THEN excluded.direction
+				ELSE messages.direction
+			END,
+			status = CASE
+				WHEN messages.status = ? THEN messages.status
+				ELSE excluded.status
+			END
 	`,
 		msg.ID,
 		msg.SenderNamespace,
@@ -625,6 +719,8 @@ func (d *Database) StoreMessage(
 		FolderInbox,
 		now,
 		now,
+		DirectionQueued,
+		StatusDelivered,
 	)
 
 	if err != nil {
@@ -757,100 +853,6 @@ func (d *Database) ListMessagesInFolder(folder string) ([]StoredMessage, error) 
 	return out, nil
 }
 
-// ApplyMailboxOp records a signed op and applies last-writer-wins folder
-// state for the message when the op timestamp is newer than current state.
-// Unknown message IDs are still journalled so late-arriving envelopes
-// converge when they appear. Returns true when local folder state changed.
-func (d *Database) ApplyMailboxOp(op MailboxOp) (bool, error) {
-	if strings.TrimSpace(op.MessageID) == "" {
-		return false, fmt.Errorf("mailbox op has no message id")
-	}
-	if op.Op != MailboxOpMove && op.Op != MailboxOpDelete {
-		return false, fmt.Errorf("unknown mailbox op %q", op.Op)
-	}
-	folder := FolderDeleted
-	if op.Op == MailboxOpMove {
-		normalised, err := NormaliseFolder(op.Folder)
-		if err != nil {
-			return false, err
-		}
-		folder = normalised
-	}
-	now := time.Now().Unix()
-	if _, err := d.DB.Exec(`
-		INSERT INTO mailbox_ops(
-			message_id, op, folder,
-			sender_namespace, sender_public_key,
-			recipient_namespace, recipient_public_key,
-			author_namespace, author_public_key,
-			timestamp, signature, submitted_at
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-		ON CONFLICT(message_id, op, timestamp, author_public_key)
-		DO NOTHING
-	`, op.MessageID, op.Op, folder, op.SenderNS, op.SenderKey,
-		op.RecipientNS, op.RecipientKey, op.AuthorNS, op.AuthorKey,
-		op.Timestamp, op.Signature, now); err != nil {
-		return false, fmt.Errorf("record mailbox op: %w", err)
-	}
-	res, err := d.DB.Exec(`
-		UPDATE messages
-		SET folder = ?, folder_updated_at = ?, folder_updated_signature = ?
-		WHERE id = ? AND (
-			folder_updated_at < ? OR
-			(folder_updated_at = ? AND folder_updated_signature < ?)
-		)
-	`, folder, op.Timestamp, op.Signature, op.MessageID,
-		op.Timestamp, op.Timestamp, op.Signature)
-	if err != nil {
-		return false, fmt.Errorf("apply mailbox op: %w", err)
-	}
-	affected, err := res.RowsAffected()
-	if err != nil {
-		return false, fmt.Errorf("mailbox op rows: %w", err)
-	}
-	return affected > 0, nil
-}
-
-// ListMailboxOpsSince returns ops journalled after the given rowid watermark.
-func (d *Database) ListMailboxOpsSince(since int64, limit int) ([]MailboxOp, int64, error) {
-	if limit <= 0 || limit > 500 {
-		limit = 200
-	}
-	rows, err := d.DB.Query(`
-		SELECT rowid, message_id, op, folder,
-			sender_namespace, sender_public_key,
-			recipient_namespace, recipient_public_key,
-			author_namespace, author_public_key,
-			timestamp, signature, submitted_at
-		FROM mailbox_ops
-		WHERE rowid > ?
-		ORDER BY rowid ASC
-		LIMIT ?
-	`, since, limit)
-	if err != nil {
-		return nil, since, fmt.Errorf("list mailbox ops: %w", err)
-	}
-	defer rows.Close()
-	var ops []MailboxOp
-	watermark := since
-	for rows.Next() {
-		var op MailboxOp
-		var rowid int64
-		if err := rows.Scan(&rowid, &op.MessageID, &op.Op, &op.Folder,
-			&op.SenderNS, &op.SenderKey, &op.RecipientNS, &op.RecipientKey,
-			&op.AuthorNS, &op.AuthorKey, &op.Timestamp, &op.Signature,
-			&op.SubmittedAt); err != nil {
-			return nil, since, fmt.Errorf("scan mailbox op: %w", err)
-		}
-		ops = append(ops, op)
-		watermark = rowid
-	}
-	if err := rows.Err(); err != nil {
-		return nil, since, fmt.Errorf("iterate mailbox ops: %w", err)
-	}
-	return ops, watermark, nil
-}
-
 // GetMessageFolder returns the current folder of a stored message.
 func (d *Database) GetMessageFolder(id string) (string, error) {
 	var folder string
@@ -859,6 +861,54 @@ func (d *Database) GetMessageFolder(id string) (string, error) {
 		return "", err
 	}
 	return folder, nil
+}
+
+// MoveMessage changes only this device's local mailbox folder.
+func (d *Database) MoveMessage(id, folder string) error {
+	normalised, err := NormaliseFolder(folder)
+	if err != nil {
+		return err
+	}
+	result, err := d.DB.Exec(`UPDATE messages SET folder = ? WHERE id = ?`, normalised, id)
+	if err != nil {
+		return fmt.Errorf("move local message: %w", err)
+	}
+	rows, err := result.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("check local message move: %w", err)
+	}
+	if rows == 0 {
+		return sql.ErrNoRows
+	}
+	return nil
+}
+
+// DeleteMessage permanently removes a message from this device.
+func (d *Database) DeleteMessage(id string) error {
+	tx, err := d.DB.Begin()
+	if err != nil {
+		return fmt.Errorf("begin message deletion: %w", err)
+	}
+	defer tx.Rollback()
+
+	result, err := tx.Exec(`DELETE FROM messages WHERE id = ?`, id)
+	if err != nil {
+		return fmt.Errorf("delete message: %w", err)
+	}
+	deleted, err := result.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("check message deletion: %w", err)
+	}
+	if deleted == 0 {
+		return sql.ErrNoRows
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit message deletion: %w", err)
+	}
+	if _, err := d.DB.Exec(`PRAGMA wal_checkpoint(TRUNCATE)`); err != nil {
+		return fmt.Errorf("checkpoint deleted message data: %w", err)
+	}
+	return nil
 }
 
 func (d *Database) UpdateMessageStatus(
@@ -1125,228 +1175,6 @@ func hexDigit(value byte) (byte, bool) {
 	default:
 		return 0, false
 	}
-}
-
-// HeldMessage represents a message stored for hold-and-forward delivery
-type HeldMessage struct {
-	ID                 string
-	SenderNamespace    string
-	SenderPublicKey    []byte
-	RecipientNamespace string
-	RecipientPublicKey []byte
-	Payload            []byte
-	CreatedAt          int64
-	ExpiresAt          int64
-	StoredAt           int64
-}
-
-// MailboxMessage records the identities needed to authorise mailbox ops.
-// Unlike held_messages, this metadata survives successful delivery.
-type MailboxMessage struct {
-	ID                 string
-	SenderNamespace    string
-	SenderPublicKey    []byte
-	RecipientNamespace string
-	RecipientPublicKey []byte
-	CreatedAt          int64
-	StoredAt           int64
-}
-
-// RegisterMailboxMessage records durable ownership metadata for a message.
-func (d *Database) RegisterMailboxMessage(
-	id string,
-	senderNamespace string,
-	senderPublicKey []byte,
-	recipientNamespace string,
-	recipientPublicKey []byte,
-	createdAt int64,
-) error {
-	_, err := d.DB.Exec(`
-		INSERT INTO mailbox_messages(
-			id, sender_namespace, sender_public_key,
-			recipient_namespace, recipient_public_key, created_at, stored_at
-		) VALUES (?, ?, ?, ?, ?, ?, ?)
-		ON CONFLICT(id) DO NOTHING
-	`, id, senderNamespace, senderPublicKey, recipientNamespace,
-		recipientPublicKey, createdAt, time.Now().Unix())
-	if err != nil {
-		return fmt.Errorf("register mailbox message: %w", err)
-	}
-	return nil
-}
-
-// GetMailboxMessage retrieves ownership metadata retained after delivery.
-func (d *Database) GetMailboxMessage(id string) (*MailboxMessage, error) {
-	row := d.DB.QueryRow(`
-		SELECT id, sender_namespace, sender_public_key,
-			recipient_namespace, recipient_public_key, created_at, stored_at
-		FROM mailbox_messages
-		WHERE id = ?
-	`, id)
-
-	var stored MailboxMessage
-	if err := row.Scan(&stored.ID, &stored.SenderNamespace,
-		&stored.SenderPublicKey, &stored.RecipientNamespace,
-		&stored.RecipientPublicKey, &stored.CreatedAt, &stored.StoredAt); err != nil {
-		if err == sql.ErrNoRows {
-			return nil, fmt.Errorf("mailbox message %q not found", id)
-		}
-		return nil, fmt.Errorf("get mailbox message: %w", err)
-	}
-	return &stored, nil
-}
-
-// StoreHeldMessage stores an encrypted message for hold-and-forward delivery
-func (d *Database) StoreHeldMessage(id string, senderNamespace string, senderPublicKey []byte,
-	recipientNamespace string, recipientPublicKey []byte, payload []byte,
-	createdAt int64, expiresAt int64) error {
-	if err := d.RegisterMailboxMessage(id, senderNamespace, senderPublicKey,
-		recipientNamespace, recipientPublicKey, createdAt); err != nil {
-		return err
-	}
-
-	_, err := d.DB.Exec(`
-		INSERT INTO held_messages(id, sender_namespace, sender_public_key,
-			recipient_namespace, recipient_public_key, payload, created_at, expires_at, stored_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-		ON CONFLICT(id) DO NOTHING
-	`, id, senderNamespace, senderPublicKey, recipientNamespace, recipientPublicKey,
-		payload, createdAt, expiresAt, time.Now().Unix())
-
-	if err != nil {
-		return fmt.Errorf("store held message: %w", err)
-	}
-
-	return nil
-}
-
-// GetHeldMessagesForRecipient retrieves all held messages for a specific recipient
-func (d *Database) GetHeldMessagesForRecipient(recipientPublicKey []byte) ([]HeldMessage, error) {
-	rows, err := d.DB.Query(`
-		SELECT id, sender_namespace, sender_public_key, recipient_namespace,
-		       recipient_public_key, payload, created_at, expires_at, stored_at
-		FROM held_messages
-		WHERE recipient_public_key = ?
-		ORDER BY created_at ASC
-	`, recipientPublicKey)
-	if err != nil {
-		return nil, fmt.Errorf("query held messages: %w", err)
-	}
-	defer rows.Close()
-
-	var messages []HeldMessage
-	for rows.Next() {
-		var hm HeldMessage
-		err := rows.Scan(&hm.ID, &hm.SenderNamespace, &hm.SenderPublicKey,
-			&hm.RecipientNamespace, &hm.RecipientPublicKey, &hm.Payload,
-			&hm.CreatedAt, &hm.ExpiresAt, &hm.StoredAt)
-		if err != nil {
-			return nil, fmt.Errorf("scan held message: %w", err)
-		}
-		messages = append(messages, hm)
-	}
-
-	return messages, rows.Err()
-}
-
-// DeleteHeldMessage removes a held message after successful delivery
-func (d *Database) DeleteHeldMessage(id string) error {
-	_, err := d.DB.Exec(`
-		DELETE FROM held_messages WHERE id = ?
-	`, id)
-	if err != nil {
-		return fmt.Errorf("delete held message: %w", err)
-	}
-	return nil
-}
-
-// DeleteExpiredHeldMessages removes held messages that have expired (30-day TTL)
-func (d *Database) DeleteExpiredHeldMessages() error {
-	_, err := d.DB.Exec(`
-		DELETE FROM held_messages
-		WHERE expires_at <= ?
-	`, time.Now().Unix())
-	if err != nil {
-		return fmt.Errorf("delete expired held messages: %w", err)
-	}
-	return nil
-}
-
-// CountHeldMessages returns the number of held messages in the database
-func (d *Database) CountHeldMessages() (int, error) {
-	var count int
-	err := d.DB.QueryRow(`
-		SELECT COUNT(*) FROM held_messages
-	`).Scan(&count)
-	if err != nil {
-		return 0, fmt.Errorf("count held messages: %w", err)
-	}
-	return count, nil
-}
-
-// HeldMessageExists reports whether a held message with the given ID is
-// already stored. It is used to make hold-and-forward delivery idempotent.
-func (d *Database) HeldMessageExists(id string) (bool, error) {
-	var count int
-
-	err := d.DB.QueryRow(`
-		SELECT COUNT(*) FROM held_messages WHERE id = ?
-	`, id).Scan(&count)
-	if err != nil {
-		return false, fmt.Errorf(
-			"check held message: %w",
-			err,
-		)
-	}
-
-	return count > 0, nil
-}
-
-// GetHeldMessage retrieves a single held message by ID.
-func (d *Database) GetHeldMessage(id string) (*HeldMessage, error) {
-	row := d.DB.QueryRow(`
-		SELECT
-			id,
-			sender_namespace,
-			sender_public_key,
-			recipient_namespace,
-			recipient_public_key,
-			payload,
-			created_at,
-			expires_at,
-			stored_at
-		FROM held_messages
-		WHERE id = ?
-	`, id)
-
-	var hm HeldMessage
-
-	err := row.Scan(
-		&hm.ID,
-		&hm.SenderNamespace,
-		&hm.SenderPublicKey,
-		&hm.RecipientNamespace,
-		&hm.RecipientPublicKey,
-		&hm.Payload,
-		&hm.CreatedAt,
-		&hm.ExpiresAt,
-		&hm.StoredAt,
-	)
-	if err != nil {
-		if err == sql.ErrNoRows {
-			return nil, fmt.Errorf(
-				"held message %q not found",
-				id,
-			)
-		}
-
-		return nil, fmt.Errorf(
-			"get held message: %w",
-			err,
-		)
-	}
-
-	return &hm, nil
 }
 
 // Route is a temporary, expiring description of how a peer can be reached.

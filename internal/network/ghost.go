@@ -1,7 +1,6 @@
 package network
 
 import (
-	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"strings"
@@ -22,10 +21,9 @@ type relayProbeBody struct {
 // ghostForwardBody wraps one envelope for multi-hop relay. Each layer names
 // only the next hop; the inner payload stays opaque to relays.
 type ghostForwardBody struct {
-	NextNamespace string                   `json:"next_namespace,omitempty"`
-	NextPublicKey string                   `json:"next_public_key,omitempty"`
-	HopsLeft      int                      `json:"hops_left"`
-	Envelope      message.EncryptedMessage `json:"envelope"`
+	NextMailboxID string                  `json:"next_mailbox_id,omitempty"`
+	HopsLeft      int                     `json:"hops_left"`
+	Envelope      message.MailboxEnvelope `json:"envelope"`
 }
 
 // maxGhostHops bounds forwarding loops across cooperating Daddies.
@@ -34,8 +32,6 @@ const maxGhostHops = 5
 // handleRelayProbe answers a latency probe with the echoed nonce.
 func handleRelayProbe(
 	session *Session,
-	local *identity.Identity,
-	db *database.Database,
 	raw json.RawMessage,
 ) error {
 	var probe relayProbeBody
@@ -47,18 +43,12 @@ func handleRelayProbe(
 		})
 	}
 
-	_ = db.RecordPeerIdentityWithKey(
-		session.PeerNamespace,
-		[]byte(session.Peer),
-		session.PeerEncryptionKey,
-	)
-
 	return sendMessage(session, Message{
 		Type: messageTypeRelayProbeAck,
 		Data: marshalJSON(relayProbeBody{
 			Nonce:     probe.Nonce,
 			SentAt:    probe.SentAt,
-			Responder: hex.EncodeToString(local.PublicKey),
+			Responder: "",
 		}),
 	})
 }
@@ -71,7 +61,7 @@ func ProbeRelay(
 ) (int64, error) {
 	start := time.Now()
 
-	session, err := Dial(relay, local, db)
+	session, err := DialAnonymous(relay, db)
 	if err != nil {
 		return 0, err
 	}
@@ -136,9 +126,7 @@ func ProbeRelaysAll(
 	return out
 }
 
-// handleGhostForward receives an onion-style forward: verify the envelope
-// signature, deliver locally when addressed here, else advance one hop.
-// Relays never decrypt the payload.
+// handleGhostForward advances an opaque mailbox envelope without identity data.
 func handleGhostForward(
 	session *Session,
 	local *identity.Identity,
@@ -154,7 +142,7 @@ func handleGhostForward(
 		})
 	}
 
-	if err := body.Envelope.Verify(); err != nil {
+	if err := body.Envelope.Validate(); err != nil {
 		return sendMessage(session, Message{
 			Type: messageTypeGhostForwardAck,
 			Data: marshalJSON(ackBody{
@@ -176,11 +164,17 @@ func handleGhostForward(
 		})
 	}
 
-	localKey := hex.EncodeToString(local.PublicKey)
-
-	if body.Envelope.RecipientNamespace == local.Namespace &&
-		strings.EqualFold(body.Envelope.RecipientPublicKey, localKey) {
-		status, reason := deliverEnvelopeLocally(db, local, body.Envelope)
+	localMailboxID, err := db.GetOrCreateMailboxID()
+	if err != nil {
+		return err
+	}
+	if body.Envelope.MailboxID == localMailboxID {
+		status := statusDelivered
+		reason := ""
+		if err := receiveMailboxEnvelope(db, local, body.Envelope); err != nil {
+			status = statusRejected
+			reason = err.Error()
+		}
 
 		return sendMessage(session, Message{
 			Type: messageTypeGhostForwardAck,
@@ -192,7 +186,7 @@ func handleGhostForward(
 		})
 	}
 
-	if err := forwardGhostEnvelope(local, db, body); err != nil {
+	if err := forwardGhostEnvelope(db, body); err != nil {
 		return sendMessage(session, Message{
 			Type: messageTypeGhostForwardAck,
 			Data: marshalJSON(ackBody{
@@ -209,33 +203,21 @@ func handleGhostForward(
 	})
 }
 
-// forwardGhostEnvelope advances one layer: direct route, sibling, else hold.
 func forwardGhostEnvelope(
-	local *identity.Identity,
 	db *database.Database,
 	body ghostForwardBody,
 ) error {
-	recipientKey, err := decodeHexField(body.Envelope.RecipientPublicKey)
-	if err != nil {
-		return err
-	}
-
-	if route, err := db.GetRoute(
-		body.Envelope.RecipientNamespace,
-		recipientKey,
-	); err == nil {
+	if route, err := db.GetMailboxRoute(body.Envelope.MailboxID); err == nil {
 		next := ghostForwardBody{
-			NextNamespace: body.Envelope.RecipientNamespace,
-			NextPublicKey: body.Envelope.RecipientPublicKey,
+			NextMailboxID: body.Envelope.MailboxID,
 			HopsLeft:      body.HopsLeft - 1,
 			Envelope:      body.Envelope,
 		}
 
-		if err := sendGhostForward(route.Address, local, db, next); err == nil {
+		if err := sendGhostForward(route, db, next); err == nil {
 			return nil
 		}
-
-		_ = db.DeleteRoute(body.Envelope.RecipientNamespace, recipientKey, route.Address)
+		_ = db.DeleteExpiredMailboxRoutes()
 	}
 
 	for _, sibling := range DaddyAddresses(db, DefaultRelaysPath()) {
@@ -244,13 +226,12 @@ func forwardGhostEnvelope(
 		}
 
 		next := ghostForwardBody{
-			NextNamespace: body.NextNamespace,
-			NextPublicKey: body.NextPublicKey,
+			NextMailboxID: body.NextMailboxID,
 			HopsLeft:      body.HopsLeft - 1,
 			Envelope:      body.Envelope,
 		}
 
-		if err := sendGhostForward(sibling, local, db, next); err == nil {
+		if err := sendGhostForward(sibling, db, next); err == nil {
 			return nil
 		}
 	}
@@ -260,31 +241,17 @@ func forwardGhostEnvelope(
 		return err
 	}
 
-	senderKey, err := decodeHexField(body.Envelope.SenderPublicKey)
-	if err != nil {
-		return err
-	}
-
-	return db.StoreHeldMessage(
-		body.Envelope.ID,
-		body.Envelope.SenderNamespace,
-		senderKey,
-		body.Envelope.RecipientNamespace,
-		recipientKey,
-		payload,
-		body.Envelope.CreatedAt,
-		time.Now().Add(time.Duration(HeldMessageTTL)*time.Second).Unix(),
-	)
+	return db.StoreOpaqueHeldMessage(body.Envelope.ID, body.Envelope.MailboxID,
+		payload, time.Now().Add(time.Duration(HeldMessageTTL)*time.Second).Unix())
 }
 
 // sendGhostForward transmits one layer and requires an ack.
 func sendGhostForward(
 	address string,
-	local *identity.Identity,
 	db *database.Database,
 	body ghostForwardBody,
 ) error {
-	session, err := Dial(address, local, db)
+	session, err := DialAnonymous(address, db)
 	if err != nil {
 		return err
 	}

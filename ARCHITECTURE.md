@@ -11,8 +11,8 @@ The codebase is organized into a few major areas:
 - `cmd/inkmail/` — the interactive user CLI
 - `cmd/inkmaild/` — the background daemon/listener
 - `internal/identity/` — identity generation and validation
-- `internal/database/` — SQLite-backed local state and mailbox tracking
-- `internal/message/` — message signing, encryption, and mailbox-operation verification
+- `internal/database/` — SQLite-backed local state, contacts, and opaque relay mailbox storage
+- `internal/message/` — message signing, encryption, and opaque mailbox envelopes
 - `internal/network/` — direct and relay-based transport, route registration, delivery flow, and mailbox-sync logic
 
 The CLI and daemon share the same identity and storage logic, but they are intentionally separated so the user can interact with the mail client while the daemon keeps the network side available in the background.
@@ -29,7 +29,7 @@ Each local node gets:
 - an X25519 keypair for end-to-end message encryption,
 - a namespace string used as a logical account scope.
 
-The code generates these keys on first launch and stores them securely on disk using strict file permissions (`0600` for private keys, `0644` for public material).
+The code generates these keys on first launch and stores them securely on disk using strict file permissions (`0600` for private keys, `0644` for public material). SQLite separately creates a random 256-bit mailbox ID shared as part of a contact bundle; it is not derived from either keypair.
 
 ### Why this is effective
 
@@ -43,7 +43,12 @@ The Ed25519 identity proves the sender is who they claim to be. The X25519 pair 
 
 ### Security benefit
 
-This means that relays and Daddy nodes do not need private signing keys or decryption keys to operate. They can only see encrypted content and route metadata.
+This means that relays and Daddy nodes do not need private signing keys or
+decryption keys to operate. The Daddy-facing wire envelope wraps the existing
+signed end-to-end encrypted envelope in a second X25519/ChaCha20-Poly1305 layer.
+Its outer fields are a random mailbox ID, random envelope ID, ephemeral key,
+nonce, and padded ciphertext. Sender/recipient cryptographic identities and
+user-visible message metadata are inside that encrypted payload.
 
 ## 2. Local SQLite database
 
@@ -52,8 +57,8 @@ The database layer in `internal/database/` stores the durable user state:
 - peer identities and aliases,
 - route records and expiration timestamps,
 - encrypted or decrypted message records,
-- held messages waiting for pickup,
-- mailbox operations such as move/delete mutations,
+- opaque encrypted envelopes waiting for pickup,
+- local mailbox folders and an encrypted-envelope outbox,
 - local metadata such as sync watermarks and listening port state.
 
 The database initializes with SQLite WAL mode and foreign-key enforcement, which helps keep writes atomic and local state easier to recover in the event of a crash.
@@ -145,14 +150,17 @@ This is a good pattern because it prevents transport-key reuse and keeps the ses
 The network layer supports route registration and lookup through Daddy or direct peers.
 
 - `REGISTER_ROUTE` stores a temporary address that a node claims to own.
-- `LOOKUP_ROUTE` resolves a peer identity to an active route.
+- `LOOKUP_ROUTE` resolves an opaque mailbox ID to an active route.
 - The route includes expiration metadata, and route registration is capped by a max lifetime.
 
 The code does not allow an unlimited route or a permanent point of contact. The route TTL is deliberately short, which reduces stale routes and helps the network converge.
 
 ### Why this is effective
 
-The route is tied to the authenticated session, not to a client-supplied claim in the request body. Daddy verifies the identity from the handshake itself before accepting a route. This stops a malicious client from advertising somebody else’s address.
+The route is keyed by a high-entropy mailbox bearer ID. Daddy-facing handshakes
+use a random one-session relay identity, and route requests contain no namespace
+or public key. Daddy still learns the advertised address associated with that
+mailbox ID while the route is active.
 
 ## 6. Direct delivery, relay fallback, and hold-and-forward
 
@@ -164,7 +172,9 @@ If a route is known and reachable, the sender dials the recipient directly and d
 
 ### Relay/Daddy fallback
 
-If a route is unavailable, the sender can hand the encrypted envelope to Daddy, which stores it and later delivers it to the recipient when they fetch messages.
+If a route is unavailable, the sender hands a padded opaque mailbox envelope to
+Daddy. Daddy indexes it by mailbox ID, stores only ciphertext temporarily, and
+returns it when that mailbox polls.
 
 The protocol supports a hold-and-forward model and a direct message flow, and it distinguishes “accepted responsibility” from “fully delivered.”
 
@@ -176,29 +186,41 @@ This makes the network resilient to partial connectivity, NAT, and transient rel
 
 This architecture still assumes the relay network is reachable and that the user configures valid endpoints. If a relay is malicious or misconfigured, it can still observe metadata such as routing or timing. The code does not conceal the existence of a message from a relay; it only hides the contents.
 
-## 7. Mailbox operations and sync
+## 7. Local mailbox and delivery receipts
 
-Mailbox state is not just an inbox list; it includes signed mutations such as move and delete.
+`msg mv` updates only the local `messages.folder` field. `msg del` deletes the
+local message row, securely erases freed SQLite pages, and checkpoints the WAL.
+Neither operation contacts Daddy or creates a synchronization record. Moving a
+message into the local `deleted` folder is separate from hard deletion.
 
-The code in `internal/message/mailboxop.go` creates a signed request that includes:
+Outgoing messages move from `queued` to `pending` after Daddy accepts the
+envelope. After a recipient verifies and saves an incoming message, it sends a
+recipient-signed receipt as another opaque encrypted mailbox envelope addressed
+to the sender's mailbox ID. Each Daddy immediately removes a held envelope
+after its delivery ACK. The receipt is held only as an active encrypted
+envelope until the sender fetches and acknowledges it; the sender verifies its
+signed inner message and changes the matching outgoing item to `delivered`.
 
-- message ID,
-- op type (`move` or `delete`),
-- target folder,
-- author namespace,
-- author public key,
-- timestamp,
-- signature.
+## 8. Implemented protections and limits
 
-These requests are sent to Daddy and are then replayed to any device that owns the message.
+Daddy persists opaque mailbox routes and active ciphertext rows. A held row
+contains only a mailbox ID, random envelope ID, ciphertext, and expiry. Message
+identities, public keys, plaintext, subject, inner message ID, and local folder
+operations are encrypted or remain only on the user's device. The encrypted
+payload is padded to 64 KiB plaintext size classes.
 
-### Why this is effective
+Mailbox IDs are stable random bearer tokens, so Daddy can link multiple
+envelopes to the same opaque mailbox. Daddy can also observe advertised route
+addresses, transport source addresses, timing, and approximate padded sizes.
+Direct peers still authenticate one another by cryptographic identity. These
+changes do not provide Tor-like anonymity or traffic-analysis resistance.
 
-The operations are signed by the author, and the code verifies that the author really owns the message and is the same as the current device. This prevents arbitrary parties from rewriting a user’s mailbox state.
+Protocol v3 changes handshake versioning and mailbox request formats. V2 peers
+fail negotiation clearly. A v2 database with pending identity-bearing relay
+holds fails startup with a drain-before-upgrade error rather than silently
+discarding or retaining those records.
 
-The synchronization logic keeps a watermark and asks for only newer operations, which reduces repeated work and lets the local database converge.
-
-## 8. Daemon and CLI split
+## 9. Daemon and CLI split
 
 The project separates the user experience from the network service.
 
@@ -211,7 +233,7 @@ The daemon opens a TCP listener, stores the listening port in the database, and 
 
 This division is useful for local hosting and background operation. The CLI can remain occasional and user-driven, while the daemon maintains connectivity and mailbox availability.
 
-## 9. Security properties of the design
+## 10. Security properties of the design
 
 This architecture is intentionally layered:
 

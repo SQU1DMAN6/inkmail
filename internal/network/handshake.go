@@ -1,6 +1,6 @@
 package network
 
-// handshake.go implements the InkMail v2 authenticated handshake.
+// handshake.go implements the InkMail v3 authenticated handshake.
 //
 // The handshake retains the original HELLO / HELLO_ACK exchange but extends
 // it so that it provides, in one round trip (SPEC section 32):

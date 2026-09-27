@@ -7,7 +7,6 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"strconv"
 	"strings"
 	"time"
 
@@ -159,10 +158,19 @@ func (c *Client) handleCommand(
 		c.printHelp()
 
 	case "identity":
+		mailboxID, err := c.Database.GetOrCreateMailboxID()
+		if err != nil {
+			fmt.Printf("identity: %v\n", err)
+			return false
+		}
 		fmt.Printf(
-			"Identity: %s\nFull identity: %s\n",
+			"Identity: %s\nFull identity: %s\nContact bundle: %s::%s::%s::%s\n",
 			identity.Address(c.Identity),
 			identity.AddressFull(c.Identity),
+			c.Identity.Namespace,
+			hex.EncodeToString(c.Identity.PublicKey),
+			hex.EncodeToString(c.Identity.EncryptionPublicKey),
+			mailboxID,
 		)
 
 	case "peers":
@@ -209,7 +217,7 @@ func (c *Client) printHelp() {
 	fmt.Println("Commands:")
 	fmt.Println("  identity                 Show local identity")
 	fmt.Println("  peers [list]             List peers, aliases, status, and reachability")
-	fmt.Println("  peers add <Peer ID>      Register a peer using full identity key")
+	fmt.Println("  peers add <contact>      Register a peer contact bundle")
 	fmt.Println("  peers remove <number>    Remove a peer entry, alias and cached routes")
 	fmt.Println("  peers alias <n> <alias>  Set friendly alias for peer")
 	fmt.Println("  relays                   Show configured Daddy relays")
@@ -217,7 +225,7 @@ func (c *Client) printHelp() {
 	fmt.Println("  msg [folder]             List inbox (or folder: archive, important, all)")
 	fmt.Println("  msg mv <ID> <folder>     Move a message")
 	fmt.Println("  msg del <ID>             Delete a message")
-	fmt.Println("  msg sync                 Pull signed mailbox operations from Daddy")
+	fmt.Println("  msg sync                 Fetch opaque mailbox messages from relays")
 	fmt.Println("  open <ID>                Open a stored message")
 	fmt.Println("  send                     Send a message")
 	fmt.Println("  help                     Show this help message")
@@ -303,6 +311,13 @@ func (c *Client) listMessagesIn(folder string) {
 
 	for _, stored := range messages {
 		direction := database.NormaliseDirection(stored.Direction)
+		state := direction
+		if direction == database.DirectionSent || direction == database.DirectionQueued {
+			state = stored.Status
+			if state == "sent" {
+				state = database.StatusPending
+			}
+		}
 
 		from := fmt.Sprintf(
 			"%s::%s",
@@ -315,7 +330,7 @@ func (c *Client) listMessagesIn(folder string) {
 		fmt.Printf(
 			"%-64s  %-8s  %-24s  %s\n",
 			stored.Message.ID,
-			direction,
+			state,
 			from,
 			stored.Message.Subject,
 		)
@@ -333,14 +348,6 @@ func (c *Client) openMessage(
 			"open message: %v\n",
 			err,
 		)
-		return
-	}
-
-	if folder, err := c.Database.GetMessageFolder(id); err != nil {
-		fmt.Printf("open message: %v\n", err)
-		return
-	} else if folder == database.FolderDeleted {
-		fmt.Printf("open message: message %q is deleted\n", id)
 		return
 	}
 
@@ -385,7 +392,7 @@ func (c *Client) openMessage(
 	fmt.Println()
 }
 
-// handleMsgCommand routes msg inbox/folder views and signed mutations.
+// handleMsgCommand routes local mailbox operations and network fetches.
 func (c *Client) handleMsgCommand(args []string) {
 	if len(args) == 0 {
 		c.listMessagesIn(database.FolderInbox)
@@ -420,7 +427,6 @@ func (c *Client) handleMsgCommand(args []string) {
 	fmt.Println("Usage: msg [folder] | msg mv <ID> <folder> | msg del <ID> | msg sync")
 }
 
-// moveMessage signs a move op, applies it locally, then replicates to Daddy.
 func (c *Client) moveMessage(id string, folder string) {
 	target, err := database.NormaliseFolder(folder)
 	if err != nil {
@@ -428,27 +434,7 @@ func (c *Client) moveMessage(id string, folder string) {
 		return
 	}
 
-	stored, err := c.Database.GetMessage(strings.TrimSpace(id))
-	if err != nil {
-		fmt.Printf("msg mv: %v\n", err)
-		return
-	}
-
-	op, err := message.SignMailboxOpForMessage(
-		c.Identity.PrivateKey,
-		c.Identity.Namespace,
-		c.Identity.PublicKey,
-		&stored.Message,
-		message.MailboxOpMove,
-		target,
-		time.Now().Unix(),
-	)
-	if err != nil {
-		fmt.Printf("msg mv: %v\n", err)
-		return
-	}
-
-	if err := c.applySignedOp(op); err != nil {
+	if err := c.Database.MoveMessage(strings.TrimSpace(id), target); err != nil {
 		fmt.Printf("msg mv: %v\n", err)
 		return
 	}
@@ -456,29 +442,9 @@ func (c *Client) moveMessage(id string, folder string) {
 	fmt.Printf("Moved %s to %q.\n", strings.TrimSpace(id), target)
 }
 
-// deleteMessage signs a delete tombstone, applies it, replicates to Daddy.
+// deleteMessage permanently removes the message from this device only.
 func (c *Client) deleteMessage(id string) {
-	stored, err := c.Database.GetMessage(strings.TrimSpace(id))
-	if err != nil {
-		fmt.Printf("msg del: %v\n", err)
-		return
-	}
-
-	op, err := message.SignMailboxOpForMessage(
-		c.Identity.PrivateKey,
-		c.Identity.Namespace,
-		c.Identity.PublicKey,
-		&stored.Message,
-		message.MailboxOpDelete,
-		"",
-		time.Now().Unix(),
-	)
-	if err != nil {
-		fmt.Printf("msg del: %v\n", err)
-		return
-	}
-
-	if err := c.applySignedOp(op); err != nil {
+	if err := c.Database.DeleteMessage(strings.TrimSpace(id)); err != nil {
 		fmt.Printf("msg del: %v\n", err)
 		return
 	}
@@ -486,99 +452,17 @@ func (c *Client) deleteMessage(id string) {
 	fmt.Printf("Deleted %s.\n", strings.TrimSpace(id))
 }
 
-// applySignedOp verifies author-is-self, applies LWW state, broadcasts.
-func (c *Client) applySignedOp(op *message.MailboxOpRequest) error {
-	if err := op.Verify(); err != nil {
-		return err
-	}
-
-	selfKey := hex.EncodeToString(c.Identity.PublicKey)
-
-	if op.AuthorNS != c.Identity.Namespace ||
-		!strings.EqualFold(op.AuthorKey, selfKey) {
-		return fmt.Errorf("op author is not this device")
-	}
-
-	authorKey, err := hex.DecodeString(op.AuthorKey)
-	if err != nil {
-		return err
-	}
-
-	signature, err := hex.DecodeString(op.Signature)
-	if err != nil {
-		return err
-	}
-
-	senderKey, err := hex.DecodeString(op.SenderKey)
-	if err != nil {
-		return err
-	}
-
-	recipientKey, err := hex.DecodeString(op.RecipientKey)
-	if err != nil {
-		return err
-	}
-
-	if _, err := c.Database.ApplyMailboxOp(database.MailboxOp{
-		MessageID:    op.MessageID,
-		Op:           strings.ToLower(strings.TrimSpace(op.Op)),
-		Folder:       strings.ToLower(strings.TrimSpace(op.Folder)),
-		SenderNS:     op.SenderNS,
-		SenderKey:    senderKey,
-		RecipientNS:  op.RecipientNS,
-		RecipientKey: recipientKey,
-		AuthorNS:     op.AuthorNS,
-		AuthorKey:    authorKey,
-		Timestamp:    op.Timestamp,
-		Signature:    signature,
-	}); err != nil {
-		return err
-	}
-
-	if err := network.BroadcastMailboxOp(c.Identity, c.Database, op); err != nil {
-		fmt.Printf("Daddy sync deferred (%v); local state kept.\n", err)
-	}
-
-	c.syncMailboxQuiet()
-
-	return nil
-}
-
-// syncMailbox pulls signed ops from all relays and applies verified state.
+// syncMailbox fetches envelopes and retries opaque receipts with configured relays.
 func (c *Client) syncMailbox() {
-	since, err := c.mailboxWatermark()
-	if err != nil {
-		since = 0
+	if err := network.SyncOpaqueMailboxOutbox(c.Identity, c.Database); err != nil {
+		fmt.Printf("Mailbox outbox sync deferred: %v\n", err)
 	}
-
-	next := network.SyncMailboxOpsAll(c.Identity, c.Database, since)
-
-	if err := c.Database.SetMeta("mailbox_since", strconv.FormatInt(next, 10)); err != nil {
+	count, err := network.FetchMailboxAll(c.Identity, c.Database)
+	if err != nil {
 		fmt.Printf("msg sync: %v\n", err)
 		return
 	}
-
-	fmt.Printf("Mailbox synced (%d -> %d).\n", since, next)
-}
-
-func (c *Client) syncMailboxQuiet() {
-	since, err := c.mailboxWatermark()
-	if err != nil {
-		return
-	}
-
-	next := network.SyncMailboxOpsAll(c.Identity, c.Database, since)
-
-	_ = c.Database.SetMeta("mailbox_since", strconv.FormatInt(next, 10))
-}
-
-func (c *Client) mailboxWatermark() (int64, error) {
-	raw, err := c.Database.GetMeta("mailbox_since")
-	if err != nil || strings.TrimSpace(raw) == "" {
-		return 0, nil
-	}
-
-	return strconv.ParseInt(strings.TrimSpace(raw), 10, 64)
+	fmt.Printf("Mailbox synced (%d message(s) received).\n", count)
 }
 
 func (c *Client) probeRelays() {
@@ -735,6 +619,8 @@ func (c *Client) sendInteractive(
 	if err := c.sendMessageToPeer(
 		recipientNamespace,
 		recipientPublicKey,
+		selectedPeer.EncryptionPublicKey,
+		selectedPeer.MailboxID,
 		subject,
 		body.String(),
 	); err != nil {
@@ -756,6 +642,8 @@ func (c *Client) sendInteractive(
 func (c *Client) sendMessageToPeer(
 	recipientNamespace string,
 	recipientPublicKey []byte,
+	recipientEncryptionKey []byte,
+	recipientMailboxID string,
 	subject string,
 	body string,
 ) error {
@@ -795,6 +683,8 @@ func (c *Client) sendMessageToPeer(
 		c.Database,
 		recipientNamespace,
 		recipientPublicKey,
+		recipientEncryptionKey,
+		recipientMailboxID,
 		msg,
 	)
 	if err != nil {
@@ -812,25 +702,25 @@ func (c *Client) sendMessageToPeer(
 	//
 	// A single StoreMessage promotion flips both direction and status, so the
 	// row never lingers as direction=queued/status=sent.
+	status := database.StatusPending
+	if result != nil && result.Delivered {
+		status = database.StatusDelivered
+	}
 	if err := c.Database.StoreMessage(
 		msg,
 		database.DirectionSent,
-		"sent",
+		status,
 	); err != nil {
 		return fmt.Errorf("mark message sent: %w", err)
 	}
 
 	if result != nil && result.Delivered {
-		fmt.Println("Message delivered and acknowledged.")
+		fmt.Println("Message delivered.")
 	} else if result != nil && result.Relayed {
-		fmt.Println("Message sent to Daddy and queued for delivery.")
-		fmt.Println("Status: queued")
+		fmt.Println("Message accepted by Daddy. Status: pending.")
 	} else {
-		fmt.Println("Message accepted for delivery.")
+		fmt.Println("Message accepted for delivery. Status: pending.")
 	}
-
-	fmt.Println("Recipient has not yet confirmed receipt.")
-	fmt.Println()
 
 	if result != nil && result.Address != "" {
 		fmt.Printf("Delivered via: %s\n", result.Address)

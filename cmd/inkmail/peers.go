@@ -4,7 +4,7 @@ package main
 //
 //	peers               -> peers list (default)
 //	peers list          -> number, identity, alias, status, reachability
-//	peers add <Peer ID> -> register a new peer identity
+//	peers add <contact> -> register keys and opaque mailbox ID
 //	peers remove <num>  -> remove peer entry + alias + cached routes
 //	peers alias <n> <a> -> set/replace a friendly alias
 //
@@ -30,7 +30,7 @@ func (c *Client) handlePeersCommand(args []string) {
 	switch strings.ToLower(args[0]) {
 	case "add":
 		if len(args) != 2 {
-			fmt.Println("Usage: peers add <namespace::full-public-key-hex>")
+			fmt.Println("Usage: peers add <namespace::ed25519-key::x25519-key::mailbox-id>")
 			return
 		}
 		c.addPeer(args[1])
@@ -60,7 +60,7 @@ func (c *Client) printPeersHelp() {
 	fmt.Println("Usage:")
 	fmt.Println("  peers                  List peers (default)")
 	fmt.Println("  peers list             List peers, aliases, status, reachability")
-	fmt.Println("  peers add <Peer ID>    Register a peer (namespace::FULL-64-hex-key)")
+	fmt.Println("  peers add <contact>    Register identity keys and opaque mailbox ID")
 	fmt.Println("  peers remove <number>  Remove a peer entry, alias and cached routes")
 	fmt.Println("  peers alias <n> <a>    Set friendly alias for peer number n")
 	fmt.Println("  peers alias <n> --clear  Remove the alias")

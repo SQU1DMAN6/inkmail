@@ -9,15 +9,14 @@ import (
 	"github.com/SQU1DMAN6/inkmail/internal/identity"
 )
 
-// addPeer registers a new peer identity from a canonical Peer ID.
-// It requires the FULL Ed25519 public key; fingerprints are rejected by
-// database.ParsePeerID with a helpful message.
+// addPeer registers a peer from its complete cryptographic contact bundle.
 func (c *Client) addPeer(raw string) {
-	namespace, key, err := database.ParsePeerID(raw)
+	contact, err := database.ParsePeerContact(raw)
 	if err != nil {
 		fmt.Printf("peers add: %v\n", err)
 		return
 	}
+	namespace, key := contact.Namespace, contact.PublicKey
 	// Refuse to add our own identity as a peer.
 	if namespace == c.Identity.Namespace &&
 		len(key) == len(c.Identity.PublicKey) &&
@@ -30,12 +29,16 @@ func (c *Client) addPeer(raw string) {
 		for i := range peers {
 			if peers[i].Namespace == namespace &&
 				string(peers[i].PublicKey) == string(key) {
-				fmt.Printf("Peer already known as %d (%s).\n", i+1, peerDisplayIdentity(&peers[i]))
+				if err := c.Database.RecordPeerContact(namespace, key, contact.EncryptionPublicKey, contact.MailboxID); err != nil {
+					fmt.Printf("peers add: %v\n", err)
+					return
+				}
+				fmt.Printf("Updated contact for peer %d (%s).\n", i+1, peerDisplayIdentity(&peers[i]))
 				return
 			}
 		}
 	}
-	if err := c.Database.RecordPeerIdentity(namespace, key); err != nil {
+	if err := c.Database.RecordPeerContact(namespace, key, contact.EncryptionPublicKey, contact.MailboxID); err != nil {
 		fmt.Printf("peers add: %v\n", err)
 		return
 	}
