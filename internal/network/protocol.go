@@ -17,12 +17,14 @@ import (
 	"crypto/cipher"
 	"crypto/ed25519"
 	"encoding/json"
+	"fmt"
 	"net"
 	"os"
 	"strings"
 	"time"
 
 	"github.com/SQU1DMAN6/inkmail/internal/identity"
+	"github.com/SQU1DMAN6/inkmail/internal/message"
 )
 
 const (
@@ -30,13 +32,14 @@ const (
 	magic = "INKM"
 
 	// maxFrameSize bounds a single protocol frame (SPEC section 42).
-	maxFrameSize = 4 * 1024 * 1024
+	maxFrameSize          = 4 * 1024 * 1024
+	maxHandshakeFrameSize = 64 * 1024
 
-	// protocolVersion 3 adds opaque mailbox envelopes and mailbox routes.
-	protocolVersion = 3
+	// protocolVersion 4 binds anonymous-session status into the signed handshake.
+	protocolVersion = 4
 
 	// handshakeLabel domain-separates handshake signatures.
-	handshakeLabel = "inkmail-hello-v3"
+	handshakeLabel = "inkmail-hello-v4"
 
 	// sessionLabelInitiator / sessionLabelResponder domain-separate the
 	// directional transport keys derived during the handshake.
@@ -148,11 +151,17 @@ type Message struct {
 type Session struct {
 	Conn net.Conn
 
+	// MailboxID is the single mailbox scope this session is allowed to operate
+	// within. Privileged Daddy operations must all target the same mailbox.
+	MailboxID       string
+	fetchedMessages map[string]string
+
 	// Peer is the authenticated Ed25519 identity key of the remote node.
 	Peer ed25519.PublicKey
 
 	// PeerNamespace is the authenticated namespace of the remote node.
 	PeerNamespace string
+	PeerAnonymous bool
 
 	// PeerEncryptionKey is the authenticated X25519 encryption key of the
 	// remote node (SPEC section 32).
@@ -164,13 +173,10 @@ type Session struct {
 	recvCounter uint64
 }
 
-// Encrypted reports whether the transport layer is encrypted.
 func (s *Session) Encrypted() bool {
 	return s.sendAead != nil && s.recvAead != nil
 }
 
-// Destroy drops the session keys from memory. It must be called once the
-// connection is no longer required (SPEC section 33).
 func (s *Session) Destroy() {
 	s.sendAead = nil
 	s.recvAead = nil
@@ -178,7 +184,6 @@ func (s *Session) Destroy() {
 	s.recvCounter = 0
 }
 
-// Close destroys the session keys and closes the underlying connection.
 func (s *Session) Close() error {
 	s.Destroy()
 
@@ -189,13 +194,44 @@ func (s *Session) Close() error {
 	return s.Conn.Close()
 }
 
-// PeerFingerprint returns the display fingerprint of the authenticated peer.
 func (s *Session) PeerFingerprint() string {
 	if s.Peer == nil {
 		return ""
 	}
 
 	return identity.Fingerprint(s.Peer)
+}
+
+func (s *Session) authorizeMailboxID(mailboxID string) error {
+	if err := message.ValidateMailboxID(mailboxID); err != nil {
+		return fmt.Errorf("invalid mailbox identifier: %w", err)
+	}
+
+	mailboxID = strings.TrimSpace(mailboxID)
+	if s.MailboxID == "" {
+		s.MailboxID = mailboxID
+		return nil
+	}
+	if !strings.EqualFold(s.MailboxID, mailboxID) {
+		return fmt.Errorf("session mailbox mismatch: session bound to %s, request targeted %s", s.MailboxID, mailboxID)
+	}
+
+	return nil
+}
+
+func (s *Session) recordFetchedMessage(messageID, mailboxID string) {
+	if s.fetchedMessages == nil {
+		s.fetchedMessages = make(map[string]string)
+	}
+	s.fetchedMessages[messageID] = mailboxID
+}
+
+func (s *Session) consumeFetchedMessage(messageID, mailboxID string) bool {
+	if s.fetchedMessages[messageID] != mailboxID {
+		return false
+	}
+	delete(s.fetchedMessages, messageID)
+	return true
 }
 
 // sameBytes reports whether two byte slices are identical.

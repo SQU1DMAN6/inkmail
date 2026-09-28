@@ -9,11 +9,13 @@ package network
 // routing metadata required to deliver it (SPEC sections 43 and 44).
 
 import (
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"net"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/SQU1DMAN6/inkmail/internal/database"
@@ -127,6 +129,23 @@ func replyRegistration(
 	})
 }
 
+func authorizeMailboxOwner(session *Session, db *database.Database, mailboxID string) error {
+	if err := session.authorizeMailboxID(mailboxID); err != nil {
+		return err
+	}
+	if len(session.Peer) != 32 || session.PeerAnonymous {
+		return errors.New("stable authenticated mailbox owner required")
+	}
+	owned, err := db.MailboxOwnedBy(mailboxID, session.Peer)
+	if err != nil {
+		return err
+	}
+	if !owned {
+		return errors.New("session identity does not own mailbox")
+	}
+	return nil
+}
+
 // handleRegisterRoute authenticates the caller and stores a temporary route
 // (SPEC section 8). The identity is taken from the completed handshake, never
 // from the request body, so a client cannot advertise an identity it does not
@@ -149,6 +168,12 @@ func handleRegisterRoute(
 
 	if err := message.ValidateMailboxID(registration.MailboxID); err != nil {
 		return replyRegistration(session, statusRejected, err.Error(), 0)
+	}
+	if err := session.authorizeMailboxID(registration.MailboxID); err != nil {
+		return replyRegistration(session, statusRejected, err.Error(), 0)
+	}
+	if len(session.Peer) != 32 || session.PeerNamespace == "relay" {
+		return replyRegistration(session, statusRejected, "authenticated mailbox owner required", 0)
 	}
 
 	if err := validateAdvertisedAddress(registration.Address); err != nil {
@@ -176,10 +201,11 @@ func handleRegisterRoute(
 		)
 	}
 
-	if err := db.SetMailboxRoute(
+	if err := db.SetOwnedMailboxRoute(
 		registration.MailboxID,
 		registration.Address,
 		registration.ExpiresAt,
+		session.Peer,
 	); err != nil {
 		return replyRegistration(
 			session,
@@ -234,7 +260,7 @@ func handleLookupRoute(
 		Status: statusOK,
 	}
 
-	address, err := db.GetMailboxRoute(lookup.MailboxID)
+	address, expiresAt, err := db.GetMailboxRouteWithExpiry(lookup.MailboxID)
 	if err != nil {
 		result.Status = "unreachable"
 		result.Reason = "no active route"
@@ -244,6 +270,7 @@ func handleLookupRoute(
 
 	result.Found = true
 	result.Address = address
+	result.ExpiresAt = expiresAt
 
 	return replyLookup(session, result)
 }
@@ -267,14 +294,8 @@ func replyHold(
 // handleHoldMessage accepts an encrypted envelope for hold-and-forward
 // delivery (SPEC sections 21 to 26).
 //
-// Daddy stores ciphertext only. It validates the envelope's signature and the
-// identity of the peer that actually completed the handshake, but it can never
-// read the subject or the body (SPEC section 43).
-//
-// A sibling Daddy forwarding on behalf of the original sender is also
-// accepted: the envelope signature still proves the sender, and the forwarder
-// is an authenticated peer whose identity is recorded for abuse tracing.
-// The envelope itself is never re-signed or decrypted.
+// Daddy stores opaque ciphertext; recipients perform the envelope's
+// cryptographic authentication after decryption.
 func handleHoldMessage(
 	session *Session,
 	local *identity.Identity,
@@ -283,6 +304,12 @@ func handleHoldMessage(
 ) error {
 	var envelope message.MailboxEnvelope
 
+	if len(data) > database.MaxOpaqueEnvelopeSize {
+		return replyHold(session, "", statusRejected, "held envelope exceeds size limit")
+	}
+	if len(session.Peer) != 32 || session.PeerAnonymous {
+		return replyHold(session, "", statusRejected, "authenticated sender required")
+	}
 	if err := json.Unmarshal(data, &envelope); err != nil {
 		return replyHold(session, "", statusRejected, "malformed envelope")
 	}
@@ -290,26 +317,18 @@ func handleHoldMessage(
 	if err := envelope.Validate(); err != nil {
 		return replyHold(session, envelope.ID, statusRejected, err.Error())
 	}
-
-	// Message IDs are idempotent (SPEC section 26). Re-offering the same
-	// logical message is not an error.
-	alreadyStored, err := db.OpaqueHeldMessageExists(envelope.ID)
-	if err != nil {
-		return replyHold(session, envelope.ID, statusRejected, err.Error())
-	}
-
-	if alreadyStored {
-		return replyHold(session, envelope.ID, statusAlreadyStored, "")
-	}
-
 	payload, err := json.Marshal(envelope)
 	if err != nil {
 		return replyHold(session, envelope.ID, statusRejected, err.Error())
 	}
 
 	expiresAt := time.Now().Add(HeldMessageTTL * time.Second).Unix()
-	if err := db.StoreOpaqueHeldMessage(envelope.ID, envelope.MailboxID, payload, expiresAt); err != nil {
+	stored, err := db.StoreOpaqueHeldMessageForUser(envelope.ID, envelope.MailboxID, payload, expiresAt, session.Peer)
+	if err != nil {
 		return replyHold(session, envelope.ID, statusRejected, err.Error())
+	}
+	if !stored {
+		return replyHold(session, envelope.ID, statusAlreadyStored, "")
 	}
 
 	// HOLD_ACK means "accepted", not "delivered" (SPEC section 24).
@@ -319,12 +338,11 @@ func handleHoldMessage(
 
 	// If the mailbox has a live route, try delivery immediately. Failure leaves
 	// only the opaque encrypted envelope held for the regular mailbox poll.
-	go relayHeldMessage(local, db, envelope)
+	scheduleRelayHeldMessage(local, db, envelope, session.Peer)
 
 	return nil
 }
 
-// replyDelivery sends a batch of encrypted envelopes to a recipient.
 func replyDelivery(
 	session *Session,
 	envelopes []message.MailboxEnvelope,
@@ -356,6 +374,9 @@ func handleFetchMessages(
 	if err := message.ValidateMailboxID(request.MailboxID); err != nil {
 		return replyDelivery(session, nil)
 	}
+	if err := authorizeMailboxOwner(session, db, request.MailboxID); err != nil {
+		return replyDelivery(session, nil)
+	}
 
 	held, err := db.ListOpaqueHeldMessages(request.MailboxID, maxHeldMessageBatch)
 	if err != nil {
@@ -385,8 +406,9 @@ func handleFetchMessages(
 			continue
 		}
 
-		if err := envelope.Validate(); err == nil {
+		if err := envelope.Validate(); err == nil && strings.EqualFold(envelope.MailboxID, request.MailboxID) {
 			envelopes = append(envelopes, envelope)
+			session.recordFetchedMessage(envelope.ID, request.MailboxID)
 		}
 	}
 
@@ -416,6 +438,15 @@ func handleDeliveryAck(
 			"delivery acknowledgement has no message ID",
 		)
 	}
+	if err := authorizeMailboxOwner(session, db, ack.MailboxID); err != nil {
+		return fmt.Errorf("unauthorized delivery acknowledgement: %w", err)
+	}
+	if ack.Status != statusDelivered && ack.Status != statusRejected {
+		return fmt.Errorf("unknown delivery status %q", ack.Status)
+	}
+	if !session.consumeFetchedMessage(ack.MessageID, ack.MailboxID) {
+		return errors.New("delivery acknowledgement does not match an envelope offered in this session")
+	}
 
 	switch ack.Status {
 	case statusDelivered:
@@ -426,17 +457,39 @@ func handleDeliveryAck(
 	case statusRejected:
 		// Keep the envelope. Daddy will retry until expires_at.
 
-	default:
-		return fmt.Errorf(
-			"unknown delivery status %q",
-			ack.Status,
-		)
 	}
 
 	return sendMessage(session, Message{
 		Type: messageTypeDeleteAck,
 		Data: marshalJSON(ackBody{MessageID: ack.MessageID, MailboxID: ack.MailboxID, Status: statusOK}),
 	})
+}
+
+var relayForwardState = struct {
+	sync.Mutex
+	active map[[32]byte]int
+}{active: make(map[[32]byte]int)}
+
+func scheduleRelayHeldMessage(local *identity.Identity, db *database.Database, envelope message.MailboxEnvelope, userKey []byte) {
+	userHash := sha256.Sum256(userKey)
+	relayForwardState.Lock()
+	if relayForwardState.active[userHash] >= 4 {
+		relayForwardState.Unlock()
+		return
+	}
+	relayForwardState.active[userHash]++
+	relayForwardState.Unlock()
+	go func() {
+		defer func() {
+			relayForwardState.Lock()
+			relayForwardState.active[userHash]--
+			if relayForwardState.active[userHash] == 0 {
+				delete(relayForwardState.active, userHash)
+			}
+			relayForwardState.Unlock()
+		}()
+		relayHeldMessage(local, db, envelope)
+	}()
 }
 
 // ---------------------------------------------------------------------------
@@ -562,7 +615,7 @@ func RegisterRouteWithDaddy(
 		return err
 	}
 
-	session, err := DialAnonymous(daddyAddress, db)
+	session, err := Dial(daddyAddress, local, db)
 	if err != nil {
 		return fmt.Errorf("connect to Daddy: %w", err)
 	}
@@ -572,6 +625,9 @@ func RegisterRouteWithDaddy(
 	mailboxID, err := db.GetOrCreateMailboxID()
 	if err != nil {
 		return err
+	}
+	if err := session.authorizeMailboxID(mailboxID); err != nil {
+		return fmt.Errorf("authorize mailbox route registration: %w", err)
 	}
 	registration := routeRegistration{
 		MailboxID: mailboxID,
@@ -682,10 +738,10 @@ func LookupRouteWithDaddy(
 		return nil, err
 	}
 
-	route := &RemoteRoute{
-		Address:   result.Address,
-		ExpiresAt: time.Now().Add(DefaultRouteTTL).Unix(),
+	if result.ExpiresAt <= time.Now().Unix() {
+		return nil, fmt.Errorf("Daddy returned an expired route")
 	}
+	route := &RemoteRoute{Address: result.Address, ExpiresAt: result.ExpiresAt}
 	_ = db.SetMailboxRoute(mailboxID, route.Address, route.ExpiresAt)
 
 	return route, nil
@@ -703,7 +759,7 @@ func SendHoldMessage(
 		return errors.New("no envelope to hold")
 	}
 
-	session, err := DialAnonymous(daddyAddress, db)
+	session, err := Dial(daddyAddress, local, db)
 	if err != nil {
 		return fmt.Errorf("connect to Daddy: %w", err)
 	}
@@ -758,15 +814,19 @@ func FetchHeldMessages(
 	local *identity.Identity,
 	db *database.Database,
 ) (int, error) {
-	session, err := DialAnonymous(daddyAddress, db)
+	mailboxID, err := db.GetOrCreateMailboxID()
+	if err != nil {
+		return 0, err
+	}
+
+	session, err := Dial(daddyAddress, local, db)
 	if err != nil {
 		return 0, fmt.Errorf("connect to Daddy: %w", err)
 	}
 
 	defer session.Close()
 
-	mailboxID, err := db.GetOrCreateMailboxID()
-	if err != nil {
+	if err := session.authorizeMailboxID(mailboxID); err != nil {
 		return 0, err
 	}
 	if err := sendMessage(session, Message{
@@ -821,6 +881,13 @@ func FetchHeldMessages(
 		if ackResponse.Type != messageTypeDeleteAck {
 			return delivered, fmt.Errorf("unexpected delivery ack response %q", ackResponse.Type)
 		}
+		var ackResult ackBody
+		if err := json.Unmarshal(ackResponse.Data, &ackResult); err != nil {
+			return delivered, fmt.Errorf("unmarshal delivery ack response: %w", err)
+		}
+		if ackResult.MessageID != envelope.ID || ackResult.MailboxID != mailboxID || ackResult.Status != statusOK {
+			return delivered, fmt.Errorf("Daddy rejected or mismatched delivery acknowledgement")
+		}
 
 		if status == statusDelivered {
 			delivered++
@@ -840,19 +907,18 @@ func deliverEnvelopeToAddress(
 	recipientPublicKey []byte,
 	envelope message.MailboxEnvelope,
 ) error {
-	var session *Session
-	var err error
-	if len(recipientPublicKey) == 0 {
-		session, err = DialAnonymous(address, db)
-	} else {
-		session, err = Dial(address, local, db)
-	}
+	session, err := Dial(address, local, db)
 	if err != nil {
 		return err
 	}
 	defer session.Close()
 	if len(recipientPublicKey) > 0 && !sameBytes([]byte(session.Peer), recipientPublicKey) {
 		return fmt.Errorf("peer at %s is not the intended recipient", address)
+	}
+	if len(recipientPublicKey) == 0 {
+		if err := authorizeMailboxOwner(session, db, envelope.MailboxID); err != nil {
+			return fmt.Errorf("route endpoint is not the mailbox owner: %w", err)
+		}
 	}
 	if err := sendMessage(session, Message{Type: messageTypeMessage, Data: marshalJSON(envelope)}); err != nil {
 		return fmt.Errorf("send opaque mailbox envelope: %w", err)

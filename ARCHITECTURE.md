@@ -215,8 +215,8 @@ addresses, transport source addresses, timing, and approximate padded sizes.
 Direct peers still authenticate one another by cryptographic identity. These
 changes do not provide Tor-like anonymity or traffic-analysis resistance.
 
-Protocol v3 changes handshake versioning and mailbox request formats. V2 peers
-fail negotiation clearly. A v2 database with pending identity-bearing relay
+Protocol v4 binds anonymous-session status into the signed handshake; earlier
+protocol versions fail negotiation clearly. A v2 database with pending identity-bearing relay
 holds fails startup with a drain-before-upgrade error rather than silently
 discarding or retaining those records.
 

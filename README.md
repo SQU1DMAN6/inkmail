@@ -344,11 +344,12 @@ still reveal approximate size and activity. Direct peers still authenticate
 one another by cryptographic identity. This is not Tor-level anonymity and
 does not defeat traffic analysis.
 
-Protocol v3 is intentionally incompatible with v2 because Daddy's wire
-addressing and envelope formats changed. Peers must exchange a fresh contact
-bundle. A database with v2 held messages fails startup with a drain-before-
-upgrade error rather than silently discarding or retaining identity-bearing
-relay records.
+Protocol v4 is intentionally incompatible with v3 because anonymous-session
+status is now part of the signed handshake and mailbox operations require
+stable authenticated identities. Earlier peers fail negotiation; contact
+bundles remain mailbox-addressed. A database with v2 held messages fails
+startup with a drain-before-upgrade error rather than silently discarding or
+retaining identity-bearing relay records.
 
 ## Practical usage notes
 

@@ -30,6 +30,7 @@ import (
 // handshakeHello is the JSON body of HELLO and HELLO_ACK.
 type handshakeHello struct {
 	Version       int    `json:"version"`
+	Anonymous     bool   `json:"anonymous,omitempty"`
 	Namespace     string `json:"namespace"`
 	PublicKey     string `json:"public_key"`
 	EncryptionKey string `json:"encryption_key"`
@@ -43,9 +44,10 @@ type handshakeHello struct {
 func (h *handshakeHello) transcriptBytes() []byte {
 	return fmt.Appendf(
 		nil,
-		"%s|%d|%s|%s|%s|%s|%d",
+		"%s|%d|%t|%s|%s|%s|%s|%d",
 		handshakeLabel,
 		h.Version,
+		h.Anonymous,
 		h.Namespace,
 		h.PublicKey,
 		h.EncryptionKey,
@@ -68,6 +70,7 @@ func newHello(
 
 	hello := &handshakeHello{
 		Version:       protocolVersion,
+		Anonymous:     local.Anonymous,
 		Namespace:     local.Namespace,
 		PublicKey:     hex.EncodeToString(local.PublicKey),
 		EncryptionKey: hex.EncodeToString(local.EncryptionPublicKey),
@@ -338,6 +341,7 @@ func finishHandshake(
 
 	session.Peer = peerKey
 	session.PeerNamespace = peerHello.Namespace
+	session.PeerAnonymous = peerHello.Anonymous
 	session.PeerEncryptionKey = peerEncryptionKey
 
 	return nil

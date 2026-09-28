@@ -25,6 +25,8 @@ type Identity struct {
 	Namespace  string
 	PublicKey  ed25519.PublicKey
 	PrivateKey ed25519.PrivateKey
+	// Anonymous is included in and authenticated by the network handshake.
+	Anonymous bool
 
 	// X25519 encryption keypair for end-to-end encryption
 	EncryptionPublicKey  []byte

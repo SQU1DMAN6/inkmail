@@ -152,6 +152,12 @@ func handleGhostForward(
 			}),
 		})
 	}
+	if len(session.Peer) != 32 || session.PeerAnonymous {
+		return sendMessage(session, Message{
+			Type: messageTypeGhostForwardAck,
+			Data: marshalJSON(ackBody{MessageID: body.Envelope.ID, Status: statusRejected, Reason: "authenticated relay identity required"}),
+		})
+	}
 
 	if body.HopsLeft < 0 || body.HopsLeft > maxGhostHops {
 		return sendMessage(session, Message{
@@ -186,7 +192,7 @@ func handleGhostForward(
 		})
 	}
 
-	if err := forwardGhostEnvelope(db, body); err != nil {
+	if err := forwardGhostEnvelope(local, db, session.Peer, body); err != nil {
 		return sendMessage(session, Message{
 			Type: messageTypeGhostForwardAck,
 			Data: marshalJSON(ackBody{
@@ -204,7 +210,9 @@ func handleGhostForward(
 }
 
 func forwardGhostEnvelope(
+	local *identity.Identity,
 	db *database.Database,
+	submitterKey []byte,
 	body ghostForwardBody,
 ) error {
 	if route, err := db.GetMailboxRoute(body.Envelope.MailboxID); err == nil {
@@ -214,7 +222,7 @@ func forwardGhostEnvelope(
 			Envelope:      body.Envelope,
 		}
 
-		if err := sendGhostForward(route, db, next); err == nil {
+		if err := sendGhostForward(route, local, db, next); err == nil {
 			return nil
 		}
 		_ = db.DeleteExpiredMailboxRoutes()
@@ -231,7 +239,7 @@ func forwardGhostEnvelope(
 			Envelope:      body.Envelope,
 		}
 
-		if err := sendGhostForward(sibling, db, next); err == nil {
+		if err := sendGhostForward(sibling, local, db, next); err == nil {
 			return nil
 		}
 	}
@@ -241,17 +249,18 @@ func forwardGhostEnvelope(
 		return err
 	}
 
-	return db.StoreOpaqueHeldMessage(body.Envelope.ID, body.Envelope.MailboxID,
-		payload, time.Now().Add(time.Duration(HeldMessageTTL)*time.Second).Unix())
+	_, err = db.StoreOpaqueHeldMessageForUser(body.Envelope.ID, body.Envelope.MailboxID,
+		payload, time.Now().Add(time.Duration(HeldMessageTTL)*time.Second).Unix(), submitterKey)
+	return err
 }
 
-// sendGhostForward transmits one layer and requires an ack.
 func sendGhostForward(
 	address string,
+	local *identity.Identity,
 	db *database.Database,
 	body ghostForwardBody,
 ) error {
-	session, err := DialAnonymous(address, db)
+	session, err := Dial(address, local, db)
 	if err != nil {
 		return err
 	}

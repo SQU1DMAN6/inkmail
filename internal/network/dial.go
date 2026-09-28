@@ -85,7 +85,7 @@ func negotiateAsInitiator(
 		)
 	}
 
-	response, err := readFrame(conn)
+	response, err := readFrameLimit(conn, maxHandshakeFrameSize)
 	if err != nil {
 		return nil, fmt.Errorf(
 			"read hello ack: %w",
@@ -138,7 +138,7 @@ func negotiateAsResponder(
 	conn net.Conn,
 	local *identity.Identity,
 ) (*Session, error) {
-	data, err := readFrame(conn)
+	data, err := readFrameLimit(conn, maxHandshakeFrameSize)
 	if err != nil {
 		return nil, fmt.Errorf(
 			"read hello: %w",
@@ -277,8 +277,7 @@ func Dial(
 	return dialWithIdentity(address, local, db, true)
 }
 
-// DialAnonymous uses a one-session identity for Daddy protocol exchanges.
-// Mailbox IDs, not cryptographic identity, authorize relay mailbox requests.
+// DialAnonymous uses a one-session identity for operations that permit anonymous access.
 func DialAnonymous(address string, db PeerStore) (*Session, error) {
 	publicKey, privateKey, err := ed25519.GenerateKey(rand.Reader)
 	if err != nil {
@@ -290,6 +289,7 @@ func DialAnonymous(address string, db PeerStore) (*Session, error) {
 	}
 	local := &identity.Identity{
 		Namespace:            "relay",
+		Anonymous:            true,
 		PublicKey:            publicKey,
 		PrivateKey:           privateKey,
 		EncryptionPublicKey:  encryptionKey.PublicKey().Bytes(),

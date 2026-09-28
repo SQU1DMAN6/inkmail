@@ -150,6 +150,11 @@ func (d *Database) init() error {
 		last_seen INTEGER NOT NULL
 	);
 
+	CREATE TABLE IF NOT EXISTS mailbox_owners (
+		mailbox_id TEXT PRIMARY KEY,
+		owner_key_hash BLOB NOT NULL
+	);
+
 	CREATE INDEX IF NOT EXISTS idx_mailbox_routes_expiry
 	ON mailbox_routes(expires_at);
 
@@ -184,7 +189,8 @@ func (d *Database) init() error {
 		mailbox_id TEXT NOT NULL,
 		payload BLOB NOT NULL,
 		expires_at INTEGER NOT NULL,
-		stored_at INTEGER NOT NULL
+		stored_at INTEGER NOT NULL,
+		submitter_hash BLOB NOT NULL DEFAULT X''
 	);
 
 	CREATE INDEX IF NOT EXISTS idx_opaque_held_mailbox
@@ -192,6 +198,20 @@ func (d *Database) init() error {
 
 	CREATE INDEX IF NOT EXISTS idx_opaque_held_expiry
 	ON opaque_held_messages(expires_at);
+
+	CREATE TABLE IF NOT EXISTS opaque_envelope_dedup (
+		envelope_hash BLOB PRIMARY KEY,
+		mailbox_hash BLOB NOT NULL,
+		payload_hash BLOB NOT NULL,
+		submitter_hash BLOB NOT NULL,
+		expires_at INTEGER NOT NULL
+	);
+
+	CREATE INDEX IF NOT EXISTS idx_opaque_dedup_submitter
+	ON opaque_envelope_dedup(submitter_hash, expires_at);
+
+	CREATE INDEX IF NOT EXISTS idx_opaque_dedup_expiry
+	ON opaque_envelope_dedup(expires_at);
 
 	CREATE TABLE IF NOT EXISTS opaque_mailbox_outbox (
 		id TEXT PRIMARY KEY,
@@ -270,6 +290,10 @@ func (d *Database) migrate() error {
 		 ADD COLUMN folder_updated_at INTEGER NOT NULL DEFAULT 0`,
 		`ALTER TABLE messages
 		 ADD COLUMN folder_updated_signature BLOB NOT NULL DEFAULT X''`,
+		`ALTER TABLE opaque_held_messages
+		 ADD COLUMN submitter_hash BLOB NOT NULL DEFAULT X''`,
+		`CREATE INDEX IF NOT EXISTS idx_opaque_held_submitter
+		 ON opaque_held_messages(submitter_hash, stored_at)`,
 	}
 
 	for _, statement := range migrations {
@@ -283,6 +307,9 @@ func (d *Database) migrate() error {
 				err,
 			)
 		}
+	}
+	if err := d.backfillOpaqueEnvelopeDedup(); err != nil {
+		return err
 	}
 
 	if _, err := d.DB.Exec(`

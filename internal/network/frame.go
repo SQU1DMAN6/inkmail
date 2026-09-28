@@ -21,7 +21,6 @@ import (
 // maxUint64 guards the transport nonce counter against wrap-around.
 const maxUint64 = ^uint64(0)
 
-// writeFrame writes magic || length || payload to conn.
 func writeFrame(
 	conn net.Conn,
 	payload []byte,
@@ -32,9 +31,7 @@ func writeFrame(
 		)
 	}
 
-	if _, err := conn.Write(
-		[]byte(magic),
-	); err != nil {
+	if err := writeAll(conn, []byte(magic)); err != nil {
 		return err
 	}
 
@@ -45,19 +42,34 @@ func writeFrame(
 		uint32(len(payload)),
 	)
 
-	if _, err := conn.Write(header[:4]); err != nil {
+	if err := writeAll(conn, header[:4]); err != nil {
 		return err
 	}
 
-	_, err := conn.Write(payload)
-
-	return err
+	return writeAll(conn, payload)
 }
 
-// readFrame reads one magic || length || payload frame from conn.
+func writeAll(writer io.Writer, data []byte) error {
+	for len(data) > 0 {
+		written, err := writer.Write(data)
+		if err != nil {
+			return err
+		}
+		if written == 0 {
+			return io.ErrShortWrite
+		}
+		data = data[written:]
+	}
+	return nil
+}
+
 func readFrame(
 	conn net.Conn,
 ) ([]byte, error) {
+	return readFrameLimit(conn, maxFrameSize)
+}
+
+func readFrameLimit(conn net.Conn, limit uint32) ([]byte, error) {
 	header := make([]byte, 8)
 
 	if _, err := io.ReadFull(
@@ -77,7 +89,7 @@ func readFrame(
 		header[4:],
 	)
 
-	if length > maxFrameSize {
+	if length > maxFrameSize || length > limit {
 		return nil, fmt.Errorf(
 			"frame too large",
 		)
@@ -109,7 +121,6 @@ func transportNonce(counter uint64) []byte {
 	return nonce
 }
 
-// writeEncryptedFrame seals payload with the session send key and writes it.
 func writeEncryptedFrame(
 	session *Session,
 	payload []byte,
@@ -148,7 +159,6 @@ func writeEncryptedFrame(
 	return writeFrame(session.Conn, frame)
 }
 
-// readEncryptedFrame reads and opens one transport-encrypted frame.
 func readEncryptedFrame(
 	session *Session,
 ) ([]byte, error) {
@@ -202,7 +212,6 @@ func readEncryptedFrame(
 	return opened, nil
 }
 
-// sendMessage marshals and writes one protocol message over the session.
 func sendMessage(
 	session *Session,
 	msg Message,
@@ -224,7 +233,6 @@ func sendMessage(
 	return writeEncryptedFrame(session, data)
 }
 
-// receiveMessage reads one protocol message from the session.
 func receiveMessage(
 	session *Session,
 	msg *Message,
