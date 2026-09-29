@@ -1,0 +1,6 @@
+PACKAGE_NAME=InkMail
+VERSION=1.0.0
+TARGET_ARCHITECTURE=x64
+TARGET_OS=linux
+DESCRIPTION=Official InkMail repository, the basic private mail transmission protocol
+AUTHOR=Quan Thai

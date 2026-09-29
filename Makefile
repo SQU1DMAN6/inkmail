@@ -9,4 +9,4 @@ vet:
 	go vet ./...
 
 clean:
-	rm -rf build/
+	rm -f build/inkmaild build/inkmail
