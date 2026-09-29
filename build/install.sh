@@ -49,7 +49,7 @@ done
 while true; do
     read -p "Enter a port number to assign InkMailD to: " portnum
 
-    if [[ "$portnum" =~ ^[0-9]+$ ]] && [ "$portnum" -ge 1024 ] && [ "$portnum" -le 65535]; then
+    if [[ "$portnum" =~ ^[0-9]+$ ]] && [[ "$portnum" -ge 1024 ]] && [[ "$portnum" -le 65535]]; then
         PORT_NUM="$portnum"
         break
     else
