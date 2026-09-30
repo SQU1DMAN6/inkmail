@@ -1,14 +1,14 @@
 package network
 
-// daddy.go implements Daddy: an optional, untrusted fallback node that
-// provides route registration, route lookup, temporary relay and
-// hold-and-forward storage (SPEC sections 7, 8, 21, 23 and 41).
+// daddy.go implements Daddy: an optional transportation node that
+// provides route registration, route lookup, temporary relay and other messaging stuff
 //
 // Daddy never possesses a peer's private keys, so it can never read a
 // message subject or body. It only ever sees the encrypted envelope plus the
 // routing metadata required to deliver it (SPEC sections 43 and 44).
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/json"
 	"errors"
@@ -1052,6 +1052,26 @@ func DialPersistent(
 	local *identity.Identity,
 	db *database.Database,
 ) {
+	_ = DialPersistentWithRetry(context.Background(), daddyAddress, local, db, DefaultDaddyRetryInterval)
+}
+
+func ValidateDaddyRetryInterval(interval time.Duration) error {
+	if interval < MinDaddyRetryInterval || interval > MaxDaddyRetryInterval {
+		return fmt.Errorf("Daddy retry interval must be between %s and %s", MinDaddyRetryInterval, MaxDaddyRetryInterval)
+	}
+	return nil
+}
+
+func DialPersistentWithRetry(
+	ctx context.Context,
+	daddyAddress string,
+	local *identity.Identity,
+	db *database.Database,
+	retryInterval time.Duration,
+) error {
+	if err := ValidateDaddyRetryInterval(retryInterval); err != nil {
+		return err
+	}
 	daddies := DaddyAddresses(db, DefaultRelaysPath())
 
 	if strings.TrimSpace(daddyAddress) != "" {
@@ -1074,7 +1094,7 @@ func DialPersistent(
 	}
 
 	if len(daddies) == 0 {
-		return
+		return nil
 	}
 
 	for _, daddy := range daddies {
@@ -1086,37 +1106,85 @@ func DialPersistent(
 	stopCleanup := StartCleanupRoutine(db)
 	defer stopCleanup()
 
-	refresh := func() {
-		_ = SyncOpaqueMailboxOutbox(local, db)
+	refresh := func(registerRoutes bool) (bool, bool, bool) {
+		connected := true
+		retrySoon := false
+		routesRegistered := true
 
-		for _, daddy := range daddies {
-			if err := RegisterRouteWithDaddy(
-				daddy,
-				local,
-				db,
-			); err != nil {
-				fmt.Printf(
-					"Daddy %s: route registration failed: %v\n",
+		if registerRoutes {
+			for _, daddy := range daddies {
+				if err := RegisterRouteWithDaddy(
 					daddy,
-					err,
-				)
-
-				continue
+					local,
+					db,
+				); err != nil {
+					fmt.Printf(
+						"Daddy %s: route registration failed: %v\n",
+						daddy,
+						err,
+					)
+					connected = false
+					retrySoon = true
+					routesRegistered = false
+				}
 			}
+		}
+		if err := SyncOpaqueMailboxOutbox(local, db); err != nil {
+			fmt.Printf("Daddy outbox sync failed: %v\n", err)
+			connected = false
+			retrySoon = true
+		}
+		retried, err := RetryQueuedMessages(local, db)
+		if err != nil {
+			fmt.Printf("Queued message retry failed: %v\n", err)
+			retrySoon = true
+		}
+		if retried == 100 {
+			retrySoon = true
 		}
 		if err := collectHeldMessages(local, db); err != nil {
 			fmt.Printf("Mailbox fetch failed: %v\n", err)
+			connected = false
+			retrySoon = true
 		}
+		return connected, retrySoon, routesRegistered
 	}
 
-	// Register immediately, then refresh well before the TTL elapses.
-	refresh()
+	knownStatus := false
+	lastHealthy := false
+	var nextRouteRefresh time.Time
+	for {
+		registerRoutes := nextRouteRefresh.IsZero() || !time.Now().Before(nextRouteRefresh)
+		connected, retrySoon, routesRegistered := refresh(registerRoutes)
+		if registerRoutes && routesRegistered {
+			nextRouteRefresh = time.Now().Add(DefaultRouteTTL / 2)
+		}
+		if !knownStatus || connected != lastHealthy {
+			if connected {
+				fmt.Println("Daddy connected; mailbox service is current.")
+			} else {
+				fmt.Printf("Daddy unavailable; retrying in %s.\n", retryInterval)
+			}
+			knownStatus = true
+			lastHealthy = connected
+		}
 
-	refreshTicker := time.NewTicker(DefaultRouteTTL / 2)
-	defer refreshTicker.Stop()
-
-	for range refreshTicker.C {
-		refresh()
+		delay := retryInterval
+		if untilRouteRefresh := time.Until(nextRouteRefresh); !retrySoon && untilRouteRefresh > 0 && untilRouteRefresh < delay {
+			delay = untilRouteRefresh
+		}
+		timer := time.NewTimer(delay)
+		select {
+		case <-ctx.Done():
+			if !timer.Stop() {
+				select {
+				case <-timer.C:
+				default:
+				}
+			}
+			return nil
+		case <-timer.C:
+		}
 	}
 }
 

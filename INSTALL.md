@@ -67,6 +67,13 @@ inkmaild --data ~/.inkmail --port 25565 --daddy 129.150.63.22:25565
 ```
 
 This creates or reuses the same data directory and runs a listener on the selected port.
+If Daddy is temporarily unavailable, the daemon stays running and retries
+every 10 seconds by default. Configure the interval with `--retry-interval`
+(valid range: `1s` to `1h`):
+
+```bash
+inkmaild --retry-interval 30s
+```
 
 If you want to disable the default Daddy dependency and rely only on a local relay list, use:
 

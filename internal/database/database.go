@@ -880,6 +880,42 @@ func (d *Database) ListMessagesInFolder(folder string) ([]StoredMessage, error) 
 	return out, nil
 }
 
+func (d *Database) ListQueuedMessages(limit int) ([]StoredMessage, error) {
+	if limit <= 0 || limit > 500 {
+		limit = 100
+	}
+	rows, err := d.DB.Query(`
+		SELECT id, sender_namespace, sender_public_key, recipient_namespace,
+			recipient_public_key, subject, body, created_at, signature,
+			direction, status, stored_at
+		FROM messages WHERE direction = ? AND status != ?
+		ORDER BY stored_at ASC LIMIT ?
+	`, DirectionQueued, StatusDelivered, limit)
+	if err != nil {
+		return nil, fmt.Errorf("list queued messages: %w", err)
+	}
+	defer rows.Close()
+	var queued []StoredMessage
+	for rows.Next() {
+		var stored StoredMessage
+		var senderKey, recipientKey, signature []byte
+		if err := rows.Scan(&stored.Message.ID, &stored.Message.SenderNamespace, &senderKey,
+			&stored.Message.RecipientNamespace, &recipientKey, &stored.Message.Subject,
+			&stored.Message.Body, &stored.Message.CreatedAt, &signature,
+			&stored.Direction, &stored.Status, &stored.StoredAt); err != nil {
+			return nil, fmt.Errorf("scan queued message: %w", err)
+		}
+		stored.Message.SenderPublicKey = encodeHex(senderKey)
+		stored.Message.RecipientPublicKey = encodeHex(recipientKey)
+		stored.Message.Signature = encodeHex(signature)
+		queued = append(queued, stored)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate queued messages: %w", err)
+	}
+	return queued, nil
+}
+
 // GetMessageFolder returns the current folder of a stored message.
 func (d *Database) GetMessageFolder(id string) (string, error) {
 	var folder string

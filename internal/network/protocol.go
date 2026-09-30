@@ -50,6 +50,10 @@ const (
 	// (SPEC section 9).
 	DefaultRouteTTL = 5 * time.Minute
 
+	DefaultDaddyRetryInterval = 10 * time.Second
+	MinDaddyRetryInterval     = time.Second
+	MaxDaddyRetryInterval     = time.Hour
+
 	// DefaultCleanupPeriod is how often expired held messages and expired
 	// routes are removed (SPEC section 41).
 	DefaultCleanupPeriod = 5 * time.Minute

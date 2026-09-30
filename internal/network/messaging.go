@@ -286,14 +286,20 @@ func receiveMailboxEnvelope(
 		if err != nil {
 			return err
 		}
-		_, err = db.MarkMessageDeliveredFromReceipt(
+		matched, err := db.MarkMessageDeliveredFromReceipt(
 			receipt.MessageID,
 			local.Namespace,
 			local.PublicKey,
 			decrypted.SenderNamespace,
 			recipientKey,
 		)
-		return err
+		if err != nil {
+			return err
+		}
+		if !matched {
+			return fmt.Errorf("delivery receipt does not match a local outgoing message")
+		}
+		return nil
 	}
 
 	if err := receiveEncryptedEnvelope(db, local, payload.Envelope); err != nil {

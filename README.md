@@ -1,6 +1,6 @@
 # FtR InkMail
 
-**Current Release**: FtR InkMail 1.0.1, September 2026
+**Current Release**: FtR InkMail 1.1.0, September 2026
 
 ## Things to read
 
@@ -106,8 +106,6 @@ peers alias <number> <alias>
 ```
 
 New contacts need both full public keys and the recipient's opaque mailbox ID.
-Identity-only v1.0.0 peer entries cannot be used for private relay delivery
-until the contact bundle is re-imported.
 
 ### Add a peer
 
@@ -293,14 +291,24 @@ The code also honours `INKMAIL_DADDY` for compatibility and `INKMAIL_DATA_DIR` f
 
 ## Running the daemon
 
-The daemon listens for inbound ghost-network connections and periodically
-registers the local opaque mailbox route, retries encrypted control envelopes,
-and polls configured relays.
+The daemon listens for inbound ghost-network connections, retries locally
+queued outgoing messages and encrypted control envelopes, registers the local
+opaque mailbox route, and polls configured relays. If Daddy is unavailable,
+the daemon remains running and retries after 10 seconds by default. The healthy
+mailbox and outbox polling uses the configured interval; route registrations
+refresh at half their TTL.
 
 Example:
 
 ```bash
 ./build/inkmaild --data ~/.inkmail --port 25565 --daddy 129.150.63.22:25565
+```
+
+Set a different retry delay with `--retry-interval`; valid values range from
+`1s` to `1h`:
+
+```bash
+./build/inkmaild --retry-interval 30s
 ```
 
 If you want to disable the default Daddy fallback, pass an empty value:
@@ -309,9 +317,10 @@ If you want to disable the default Daddy fallback, pass an empty value:
 ./build/inkmaild --data ~/.inkmail --port 25565 --daddy ""
 ```
 
-The daemon logs its local identity, configured relay addresses, and listening
-port. Daddy-facing sessions use one-session relay identities rather than the
-local cryptographic identity.
+The daemon logs its local identity, configured relay addresses, listening
+port, and Daddy connectivity transitions. A failed Daddy connection is a
+recoverable state: queued messages and receipt envelopes remain local and are
+retried after connectivity returns.
 
 ## Security and trust model
 
@@ -392,4 +401,4 @@ The code in this repository is a working prototype/CLI project and the user-faci
 
 ---
 
-_FtR InkMail Mail Protocol, version 1.0.0, written by Quan Thai_
+_FtR InkMail Mail Protocol, version 1.1.0, written by Quan Thai_

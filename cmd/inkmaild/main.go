@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"flag"
 	"fmt"
 	"os"
@@ -43,6 +44,12 @@ func main() {
 		"address of the Daddy fallback node; use an empty value to disable it (relays.conf is tried first)",
 	)
 
+	retryInterval := flag.Duration(
+		"retry-interval",
+		network.DefaultDaddyRetryInterval,
+		"time to wait before retrying unavailable Daddy connectivity (1s to 1h)",
+	)
+
 	relaysPath := flag.String(
 		"relays",
 		"",
@@ -50,6 +57,10 @@ func main() {
 	)
 
 	flag.Parse()
+	if err := network.ValidateDaddyRetryInterval(*retryInterval); err != nil {
+		fmt.Fprintf(os.Stderr, "invalid retry interval: %v\n", err)
+		os.Exit(2)
+	}
 
 	if err := os.MkdirAll(
 		*dataDir,
@@ -140,11 +151,15 @@ func main() {
 		}
 	}()
 
-	go network.DialPersistent(
-		*daddy,
-		id,
-		db,
-	)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	workerDone := make(chan struct{})
+	go func() {
+		defer close(workerDone)
+		if err := network.DialPersistentWithRetry(ctx, *daddy, id, db, *retryInterval); err != nil {
+			fmt.Fprintf(os.Stderr, "Daddy retry loop stopped: %v\n", err)
+		}
+	}()
 
 	signals := make(chan os.Signal, 1)
 
@@ -155,6 +170,8 @@ func main() {
 	)
 
 	<-signals
+	cancel()
+	<-workerDone
 
 	fmt.Println(
 		"Shutting down InkMail...",

@@ -416,22 +416,40 @@ func (d *Database) MarkMessageDeliveredFromReceipt(
 	recipientNamespace string,
 	recipientPublicKey []byte,
 ) (bool, error) {
-	result, err := d.DB.Exec(`
-		UPDATE messages SET status = ?
+	tx, err := d.DB.Begin()
+	if err != nil {
+		return false, fmt.Errorf("begin delivery receipt update: %w", err)
+	}
+	defer tx.Rollback()
+
+	var status string
+	err = tx.QueryRow(`
+		SELECT status FROM messages
 		WHERE id = ? AND direction IN (?, ?) AND sender_namespace = ?
 			AND sender_public_key = ? AND recipient_namespace = ?
-			AND recipient_public_key = ? AND status != ?
-	`, StatusDelivered, messageID, DirectionSent, DirectionQueued,
-		localNamespace, localPublicKey, recipientNamespace,
-		recipientPublicKey, StatusDelivered)
-	if err != nil {
-		return false, fmt.Errorf("mark message delivered from receipt: %w", err)
+			AND recipient_public_key = ?
+	`, messageID, DirectionSent, DirectionQueued, localNamespace,
+		localPublicKey, recipientNamespace, recipientPublicKey).Scan(&status)
+	if err == sql.ErrNoRows {
+		return false, nil
 	}
-	affected, err := result.RowsAffected()
 	if err != nil {
-		return false, fmt.Errorf("check receipt state update: %w", err)
+		return false, fmt.Errorf("match delivery receipt: %w", err)
 	}
-	return affected > 0, nil
+	if status != StatusDelivered {
+		if _, err := tx.Exec(`
+			UPDATE messages SET status = ? WHERE id = ? AND direction IN (?, ?)
+				AND sender_namespace = ? AND sender_public_key = ?
+				AND recipient_namespace = ? AND recipient_public_key = ?
+		`, StatusDelivered, messageID, DirectionSent, DirectionQueued,
+			localNamespace, localPublicKey, recipientNamespace, recipientPublicKey); err != nil {
+			return false, fmt.Errorf("mark message delivered from receipt: %w", err)
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return false, fmt.Errorf("commit delivery receipt update: %w", err)
+	}
+	return true, nil
 }
 
 func validateOpaqueToken(value string) error {

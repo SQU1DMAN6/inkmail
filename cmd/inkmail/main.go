@@ -87,7 +87,7 @@ func main() {
 	fmt.Println("▝▘     ▀▀ ▝▘ ▝▀      ▀▀▀ ▝▘ ▝▘▝▘ ▀▘▝▘ ▝▘ ▀▀▝▘▝▀▀▀▘  ▀▀")
 	fmt.Println("======================================================")
 	fmt.Println("Welcome to the InkMail Client")
-	fmt.Println("InkMail 1.0, written by Quan Thai")
+	fmt.Println("InkMail 1.1.0, written by Quan Thai")
 	fmt.Printf(
 		"Identity: %s\n",
 		identity.Address(id),
