@@ -313,7 +313,9 @@ Set a different retry delay with `--retry-interval`; valid values range from
 ./build/inkmaild --retry-interval 30s
 ```
 
-If you want to disable the default Daddy fallback, pass an empty value:
+If you have an explicit local relay list and do not want an additional `--daddy`
+address, pass an empty value. When there are no configured relays, InkMail still
+uses the built-in default unless `--disable-daddy` is set:
 
 ```bash
 ./build/inkmaild --data ~/.inkmail --port 25565 --daddy ""

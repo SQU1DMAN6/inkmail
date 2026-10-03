@@ -24,6 +24,12 @@ func main() {
 		"TCP listening port",
 	)
 
+	listenAddress := flag.String(
+		"listen-address",
+		"0.0.0.0",
+		"local interface address to bind (use 127.0.0.1 for local testing)",
+	)
+
 	dataDir := flag.String(
 		"data",
 		filepath.Join(
@@ -148,18 +154,9 @@ func main() {
 		fmt.Printf("Relay: %s\n", relay)
 	}
 
-	if *daddy == "" && len(network.DaddyAddresses(db, relaysFile)) == 0 {
-		fmt.Println(
-			"Daddy: disabled",
-		)
-	} else {
-		fmt.Println(
-			"Daddy: configured",
-		)
-	}
-
 	go func() {
-		if err := network.Listen(
+		if err := network.ListenOn(
+			*listenAddress,
 			*port,
 			id,
 			db,

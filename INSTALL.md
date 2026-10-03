@@ -86,7 +86,8 @@ every 10 seconds by default. Configure the interval with `--retry-interval`
 inkmaild --retry-interval 30s
 ```
 
-If you want to disable the default Daddy dependency and rely only on a local relay list, use:
+With a populated local relay list, pass an empty `--daddy` value to avoid
+adding a separate explicit address:
 
 ```bash
 inkmaild --data ~/.inkmail --port 25565 --daddy ""

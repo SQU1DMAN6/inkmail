@@ -19,10 +19,16 @@ func Listen(
 	local *identity.Identity,
 	db *database.Database,
 ) error {
-	address := fmt.Sprintf(
-		"0.0.0.0:%d",
-		port,
-	)
+	return ListenOn("0.0.0.0", port, local, db)
+}
+
+func ListenOn(
+	host string,
+	port int,
+	local *identity.Identity,
+	db *database.Database,
+) error {
+	address := net.JoinHostPort(strings.Trim(host, "[]"), fmt.Sprintf("%d", port))
 
 	fmt.Printf(
 		"Opening InkMail TCP port %d...\n",
@@ -48,9 +54,13 @@ func Listen(
 		listener.Addr().String(),
 	)
 
+	actualPort := port
+	if tcpAddress, ok := listener.Addr().(*net.TCPAddr); ok {
+		actualPort = tcpAddress.Port
+	}
 	if err := db.SetMeta(
 		"listen_port",
-		fmt.Sprintf("%d", port),
+		fmt.Sprintf("%d", actualPort),
 	); err != nil {
 		return fmt.Errorf(
 			"store listen port: %w",
