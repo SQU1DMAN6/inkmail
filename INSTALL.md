@@ -66,6 +66,17 @@ This creates the data directory if it does not exist. The first run generates a 
 inkmaild --data ~/.inkmail --port 25565 --daddy 129.150.63.22:25565
 ```
 
+Daddy resource limits use safe defaults. An optional JSON file can override
+the documented values without changing the existing data directory:
+
+```bash
+inkmaild --data ~/.inkmail --resources /etc/inkmail/resources.json
+```
+
+Resource configuration details, defaults, ranges, and rejection behavior are
+listed in [BUILD-v1_2-REVIEW.md](doc/BUILD-v1_2-REVIEW.md). Existing
+`~/.inkmail` data must not be deleted as part of an upgrade.
+
 This creates or reuses the same data directory and runs a listener on the selected port.
 If Daddy is temporarily unavailable, the daemon stays running and retries
 every 10 seconds by default. Configure the interval with `--retry-interval`

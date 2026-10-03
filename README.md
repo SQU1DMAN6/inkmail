@@ -2,6 +2,8 @@
 
 **Current Release**: FtR InkMail 1.1.0, September 2026
 
+**Development Build**: InkMail 1.2 resource-resilience work
+
 ## Things to read
 
 1. [What InkMail does](#what-inkmail-does)
@@ -317,10 +319,42 @@ If you want to disable the default Daddy fallback, pass an empty value:
 ./build/inkmaild --data ~/.inkmail --port 25565 --daddy ""
 ```
 
+### Daddy resource limits (development build)
+
+The daemon applies bounded defaults for connections, handshakes, concurrent
+requests, request rates, held-envelope storage, replay records, and route
+registrations. Operators can override these with a JSON file passed using
+`--resources`; no file is required and existing `~/.inkmail` contents do not
+need to be edited or removed. The JSON keys also include per-identity
+concurrent requests, handshake failure threshold/window/cooldown, local outbox
+count/bytes, and peer identity/direct-route ceilings.
+
+```bash
+./build/inkmaild --data ~/.inkmail --resources /etc/inkmail/resources.json
+```
+
+The file may contain any subset of these keys; omitted values keep their safe
+defaults. Unknown keys, invalid values, and values above hard safety ceilings
+stop daemon startup. A complete example with defaults, ranges, and the
+behavior at each limit is in [BUILD-v1_2-REVIEW.md](doc/BUILD-v1_2-REVIEW.md).
+
 The daemon logs its local identity, configured relay addresses, listening
-port, and Daddy connectivity transitions. A failed Daddy connection is a
-recoverable state: queued messages and receipt envelopes remain local and are
-retried after connectivity returns.
+port, and Daddy connectivity transitions. It also writes a fixed-cardinality
+resource snapshot at startup and once per minute, including admission,
+handshake, request, message, quota, replay, route, and outbox counters. A
+failed Daddy connection is recoverable: queued messages and receipt envelopes
+remain local and are retried after connectivity returns.
+
+For an authorized local test Daddy, the bounded malformed-handshake probe and
+passive Linux process monitor are available:
+
+```bash
+python3 tools/daddy_abuse_probe.py --target 127.0.0.1:25565 --test-mode --requests 50
+python3 tools/daddy_resource_monitor.py --pid "$DADDY_PID" --test-mode --duration 120
+```
+
+The probe accepts only private, loopback, or link-local IP addresses. Both
+tools require explicit test mode and enforce request or sampling bounds.
 
 ## Security and trust model
 
@@ -356,9 +390,11 @@ does not defeat traffic analysis.
 Protocol v4 is intentionally incompatible with v3 because anonymous-session
 status is now part of the signed handshake and mailbox operations require
 stable authenticated identities. Earlier peers fail negotiation; contact
-bundles remain mailbox-addressed. A database with v2 held messages fails
-startup with a drain-before-upgrade error rather than silently discarding or
-retaining identity-bearing relay records.
+bundles remain mailbox-addressed. The 1.2 database startup path no longer
+drops legacy relay tables or clears routes, so an existing data directory can
+be opened without manual deletion. Legacy records are preserved in place; the
+new quotas govern newly admitted opaque envelopes and do not migrate or
+reinterpret legacy rows.
 
 ## Practical usage notes
 

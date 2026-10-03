@@ -11,6 +11,7 @@ import (
 	_ "modernc.org/sqlite"
 
 	"github.com/SQU1DMAN6/inkmail/internal/message"
+	"github.com/SQU1DMAN6/inkmail/internal/resource"
 )
 
 // Reserved mailbox folders. "inbox" is the default view; "archive" and
@@ -24,7 +25,10 @@ const (
 )
 
 type Database struct {
-	DB *sql.DB
+	DB                  *sql.DB
+	limits              resource.Limits
+	legacyRelayMessages int64
+	legacyRelayBytes    int64
 }
 
 type StoredMessage struct {
@@ -88,7 +92,8 @@ func Open(path string) (*Database, error) {
 	db.SetMaxOpenConns(1)
 
 	d := &Database{
-		DB: db,
+		DB:     db,
+		limits: resource.Defaults(),
 	}
 
 	if err := d.init(); err != nil {
@@ -97,6 +102,14 @@ func Open(path string) (*Database, error) {
 	}
 
 	return d, nil
+}
+
+func (d *Database) SetResourceLimits(limits resource.Limits) error {
+	if err := limits.Validate(); err != nil {
+		return err
+	}
+	d.limits = limits
+	return nil
 }
 
 func (d *Database) init() error {
@@ -235,6 +248,9 @@ func (d *Database) init() error {
 	if _, err := d.GetOrCreateMailboxID(); err != nil {
 		return err
 	}
+	if err := d.loadLegacyRelayUsage(); err != nil {
+		return err
+	}
 
 	return nil
 }
@@ -320,45 +336,9 @@ func (d *Database) migrate() error {
 		return fmt.Errorf("migrate outgoing message state: %w", err)
 	}
 
-	var legacyHoldTable int
-	if err := d.DB.QueryRow(`
-		SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'held_messages'
-	`).Scan(&legacyHoldTable); err != nil {
-		return fmt.Errorf("check legacy relay storage: %w", err)
-	}
-	if legacyHoldTable > 0 {
-		var pending int
-		if err := d.DB.QueryRow(`SELECT COUNT(*) FROM held_messages`).Scan(&pending); err != nil {
-			return fmt.Errorf("count legacy held messages: %w", err)
-		}
-		if pending > 0 {
-			return fmt.Errorf("upgrade blocked: %d v2 Daddy-held message(s) still contain identity metadata; run the previous InkMail daemon to deliver them before upgrading", pending)
-		}
-		if _, err := d.DB.Exec(`DROP TABLE held_messages`); err != nil {
-			return fmt.Errorf("remove empty legacy relay storage: %w", err)
-		}
-	}
-
-	var cleanupDone string
-	cleanupErr := d.DB.QueryRow(`SELECT value FROM node_meta WHERE key = 'v3_privacy_cleanup'`).Scan(&cleanupDone)
-	if cleanupErr == sql.ErrNoRows {
-		for _, table := range []string{"mailbox_ops", "mailbox_messages", "delivery_receipts", "delivery_receipt_outbox"} {
-			if _, err := d.DB.Exec(`DROP TABLE IF EXISTS ` + table); err != nil {
-				return fmt.Errorf("purge legacy relay metadata: %w", err)
-			}
-		}
-		if _, err := d.DB.Exec(`DELETE FROM peer_routes`); err != nil {
-			return fmt.Errorf("purge identity-keyed relay routes: %w", err)
-		}
-		if _, err := d.DB.Exec(`
-			INSERT INTO node_meta(key, value) VALUES ('v3_privacy_cleanup', '1')
-			ON CONFLICT(key) DO UPDATE SET value = excluded.value
-		`); err != nil {
-			return fmt.Errorf("record privacy migration: %w", err)
-		}
-	} else if cleanupErr != nil {
-		return fmt.Errorf("check privacy migration: %w", cleanupErr)
-	}
+	// Keep legacy relay tables and routes intact. Database upgrades must be
+	// additive so a newer daemon can open an existing ~/.inkmail directory
+	// without requiring users to discard v4 state.
 
 	// Case-insensitive alias uniqueness for databases created before the
 	// partial unique index existed. The CREATE in init() covers fresh DBs;
@@ -485,8 +465,15 @@ func (d *Database) RecordPeerIdentityWithKey(
 	encryptionPublicKey []byte,
 ) error {
 	now := time.Now().Unix()
-
-	_, err := d.DB.Exec(`
+	tx, err := d.DB.Begin()
+	if err != nil {
+		return fmt.Errorf("begin peer identity update: %w", err)
+	}
+	defer tx.Rollback()
+	if err := ensurePeerIdentityCapacity(tx, namespace, publicKey, d.limits.PeerIdentitiesGlobal); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(`
 		INSERT INTO peer_identities(
 			namespace,
 			public_key,
@@ -509,13 +496,11 @@ func (d *Database) RecordPeerIdentityWithKey(
 		encryptionPublicKey,
 		now,
 		now,
-	)
-
-	if err != nil {
-		return fmt.Errorf(
-			"record peer identity: %w",
-			err,
-		)
+	); err != nil {
+		return fmt.Errorf("record peer identity: %w", err)
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit peer identity: %w", err)
 	}
 
 	return nil
@@ -536,8 +521,16 @@ func (d *Database) RecordPeerContact(
 	if len(publicKey) != 32 || len(encryptionPublicKey) != 32 {
 		return fmt.Errorf("invalid peer public key size")
 	}
+	tx, err := d.DB.Begin()
+	if err != nil {
+		return fmt.Errorf("begin peer contact update: %w", err)
+	}
+	defer tx.Rollback()
+	if err := ensurePeerIdentityCapacity(tx, namespace, publicKey, d.limits.PeerIdentitiesGlobal); err != nil {
+		return err
+	}
 	now := time.Now().Unix()
-	_, err = d.DB.Exec(`
+	if _, err := tx.Exec(`
 		INSERT INTO peer_identities(
 			namespace, public_key, encryption_public_key, mailbox_id,
 			alias, first_seen, last_seen
@@ -546,9 +539,11 @@ func (d *Database) RecordPeerContact(
 			encryption_public_key = excluded.encryption_public_key,
 			mailbox_id = excluded.mailbox_id,
 			last_seen = excluded.last_seen
-	`, namespace, publicKey, encryptionPublicKey, mailboxID, now, now)
-	if err != nil {
+	`, namespace, publicKey, encryptionPublicKey, mailboxID, now, now); err != nil {
 		return fmt.Errorf("record peer contact: %w", err)
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit peer contact: %w", err)
 	}
 	return nil
 }
@@ -1257,8 +1252,31 @@ func (d *Database) StoreRoute(
 	expiresAt int64,
 ) error {
 	now := time.Now().Unix()
-
-	_, err := d.DB.Exec(`
+	tx, err := d.DB.Begin()
+	if err != nil {
+		return fmt.Errorf("begin peer route update: %w", err)
+	}
+	defer tx.Rollback()
+	var exists int
+	if err := tx.QueryRow(`SELECT COUNT(*) FROM peer_routes WHERE namespace = ? AND public_key = ? AND address = ?`, namespace, publicKey, address).Scan(&exists); err != nil {
+		return fmt.Errorf("check existing peer route: %w", err)
+	}
+	if exists == 0 {
+		var ownerRoutes, allRoutes int
+		if err := tx.QueryRow(`SELECT COUNT(*) FROM peer_routes WHERE namespace = ? AND public_key = ? AND expires_at > ?`, namespace, publicKey, now).Scan(&ownerRoutes); err != nil {
+			return fmt.Errorf("count peer routes for identity: %w", err)
+		}
+		if ownerRoutes >= d.limits.PeerRoutesPerIdentity {
+			return fmt.Errorf("peer route quota exceeded for identity")
+		}
+		if err := tx.QueryRow(`SELECT COUNT(*) FROM peer_routes WHERE expires_at > ?`, now).Scan(&allRoutes); err != nil {
+			return fmt.Errorf("count global peer routes: %w", err)
+		}
+		if allRoutes >= d.limits.PeerRoutesGlobal {
+			return fmt.Errorf("global peer route quota exceeded")
+		}
+	}
+	if _, err := tx.Exec(`
 		INSERT INTO peer_routes(
 			namespace,
 			public_key,
@@ -1277,12 +1295,11 @@ func (d *Database) StoreRoute(
 		address,
 		expiresAt,
 		now,
-	)
-	if err != nil {
-		return fmt.Errorf(
-			"store peer route: %w",
-			err,
-		)
+	); err != nil {
+		return fmt.Errorf("store peer route: %w", err)
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit peer route: %w", err)
 	}
 
 	return nil
@@ -1375,18 +1392,23 @@ func (d *Database) ListRoutes(
 
 // DeleteExpiredRoutes removes routes whose expiry has passed.
 func (d *Database) DeleteExpiredRoutes() error {
-	_, err := d.DB.Exec(`
+	_, err := d.DeleteExpiredRoutesCount()
+	return err
+}
+
+func (d *Database) DeleteExpiredRoutesCount() (int64, error) {
+	result, err := d.DB.Exec(`
 		DELETE FROM peer_routes
 		WHERE expires_at <= ?
 	`, time.Now().Unix())
 	if err != nil {
-		return fmt.Errorf(
-			"delete expired routes: %w",
-			err,
-		)
+		return 0, fmt.Errorf("delete expired routes: %w", err)
 	}
-
-	return nil
+	deleted, err := result.RowsAffected()
+	if err != nil {
+		return 0, fmt.Errorf("count expired routes: %w", err)
+	}
+	return deleted, nil
 }
 
 // RegisterOrReplaceRoute records a route for a peer while superseding every
@@ -1433,6 +1455,19 @@ func (d *Database) RegisterOrReplaceRoute(
 			"supersede stale peer routes: %w",
 			err,
 		)
+	}
+	var exists int
+	if err := tx.QueryRow(`SELECT COUNT(*) FROM peer_routes WHERE namespace = ? AND public_key = ? AND address = ?`, namespace, publicKey, address).Scan(&exists); err != nil {
+		return fmt.Errorf("check peer route: %w", err)
+	}
+	if exists == 0 {
+		var routeCount int
+		if err := tx.QueryRow(`SELECT COUNT(*) FROM peer_routes WHERE expires_at > ?`, now).Scan(&routeCount); err != nil {
+			return fmt.Errorf("count global peer routes: %w", err)
+		}
+		if routeCount >= d.limits.PeerRoutesGlobal {
+			return fmt.Errorf("global peer route quota exceeded")
+		}
 	}
 
 	if _, err := tx.Exec(

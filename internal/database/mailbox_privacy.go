@@ -10,12 +10,9 @@ import (
 )
 
 const (
-	MaxOpaqueEnvelopeSize   = 2 * 1024 * 1024
-	MaxOpaqueDeliveryBytes  = 3 * 1024 * 1024
-	maxHeldMessagesPerUser  = 256
-	maxHeldBytesPerUser     = 32 * 1024 * 1024
-	maxSeenEnvelopesPerUser = 4096
-	maxEnvelopeRetention    = 30 * 24 * time.Hour
+	MaxOpaqueEnvelopeSize  = 2 * 1024 * 1024
+	MaxOpaqueDeliveryBytes = 3 * 1024 * 1024
+	maxEnvelopeRetention   = 30 * 24 * time.Hour
 )
 
 // OpaqueHeldMessage contains only the mailbox address, random envelope ID and
@@ -44,13 +41,40 @@ func (d *Database) QueueOpaqueOutbox(id, mailboxID string, payload []byte) error
 	if err := validateOpaqueToken(mailboxID); err != nil {
 		return err
 	}
-	_, err := d.DB.Exec(`
+	if len(payload) == 0 || len(payload) > MaxOpaqueEnvelopeSize {
+		return fmt.Errorf("invalid opaque outbox payload size")
+	}
+	tx, err := d.DB.Begin()
+	if err != nil {
+		return fmt.Errorf("begin opaque outbox admission: %w", err)
+	}
+	defer tx.Rollback()
+	var count int
+	var storedBytes int64
+	if err := tx.QueryRow(`SELECT COUNT(*), COALESCE(SUM(length(payload)), 0) FROM opaque_mailbox_outbox`).Scan(&count, &storedBytes); err != nil {
+		return fmt.Errorf("count opaque outbox usage: %w", err)
+	}
+	var oldBytes int64
+	lookupErr := tx.QueryRow(`SELECT length(payload) FROM opaque_mailbox_outbox WHERE id = ?`, id).Scan(&oldBytes)
+	if lookupErr != nil && !errors.Is(lookupErr, sql.ErrNoRows) {
+		return fmt.Errorf("check existing opaque outbox entry: %w", lookupErr)
+	}
+	newRecord := errors.Is(lookupErr, sql.ErrNoRows)
+	if newRecord && count >= d.limits.OutboxMessages {
+		return fmt.Errorf("opaque outbox message quota exceeded")
+	}
+	if storedBytes-oldBytes+int64(len(payload)) > d.limits.OutboxBytes {
+		return fmt.Errorf("opaque outbox byte quota exceeded")
+	}
+	if _, err := tx.Exec(`
 		INSERT INTO opaque_mailbox_outbox(id, mailbox_id, payload, stored_at)
 		VALUES (?, ?, ?, ?)
 		ON CONFLICT(id) DO UPDATE SET payload = excluded.payload, stored_at = excluded.stored_at
-	`, id, mailboxID, payload, time.Now().Unix())
-	if err != nil {
+	`, id, mailboxID, payload, time.Now().Unix()); err != nil {
 		return fmt.Errorf("queue opaque mailbox envelope: %w", err)
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit opaque outbox admission: %w", err)
 	}
 	return nil
 }
@@ -137,15 +161,39 @@ func (d *Database) StoreOpaqueHeldMessageForUser(id, mailboxID string, payload [
 	if err := tx.QueryRow(`SELECT COUNT(*), COALESCE(SUM(length(payload)), 0) FROM opaque_held_messages WHERE submitter_hash = ?`, userHash[:]).Scan(&heldCount, &heldBytes); err != nil {
 		return false, fmt.Errorf("count user-held messages: %w", err)
 	}
-	if heldCount >= maxHeldMessagesPerUser || heldBytes+int64(len(payload)) > maxHeldBytesPerUser {
+	if heldCount >= d.limits.HeldMessagesPerUser || heldBytes+int64(len(payload)) > d.limits.HeldBytesPerUser {
 		return false, fmt.Errorf("authenticated user hold quota exceeded")
+	}
+	var mailboxCount int
+	var mailboxBytes int64
+	if err := tx.QueryRow(`SELECT COUNT(*), COALESCE(SUM(length(payload)), 0) FROM opaque_held_messages WHERE mailbox_id = ?`, mailboxID).Scan(&mailboxCount, &mailboxBytes); err != nil {
+		return false, fmt.Errorf("count mailbox-held messages: %w", err)
+	}
+	if mailboxCount >= d.limits.HeldMessagesPerMailbox || mailboxBytes+int64(len(payload)) > d.limits.HeldBytesPerMailbox {
+		return false, fmt.Errorf("mailbox hold quota exceeded")
+	}
+	var globalCount int
+	var globalBytes int64
+	if err := tx.QueryRow(`SELECT COUNT(*), COALESCE(SUM(length(payload)), 0) FROM opaque_held_messages`).Scan(&globalCount, &globalBytes); err != nil {
+		return false, fmt.Errorf("count globally held messages: %w", err)
+	}
+	if int64(globalCount)+d.legacyRelayMessages >= int64(d.limits.HeldMessagesGlobal) ||
+		globalBytes+d.legacyRelayBytes+int64(len(payload)) > d.limits.HeldBytesGlobal {
+		return false, fmt.Errorf("Daddy hold quota exceeded")
 	}
 	var seenCount int
 	if err := tx.QueryRow(`SELECT COUNT(*) FROM opaque_envelope_dedup WHERE submitter_hash = ? AND expires_at > ?`, userHash[:], now).Scan(&seenCount); err != nil {
 		return false, fmt.Errorf("count user replay records: %w", err)
 	}
-	if seenCount >= maxSeenEnvelopesPerUser {
+	if seenCount >= d.limits.ReplayRecordsPerUser {
 		return false, fmt.Errorf("authenticated user replay-record quota exceeded")
+	}
+	var globalSeenCount int
+	if err := tx.QueryRow(`SELECT COUNT(*) FROM opaque_envelope_dedup WHERE expires_at > ?`, now).Scan(&globalSeenCount); err != nil {
+		return false, fmt.Errorf("count global replay records: %w", err)
+	}
+	if globalSeenCount >= d.limits.ReplayRecordsGlobal {
+		return false, fmt.Errorf("Daddy replay-record quota exceeded")
 	}
 
 	if _, err := tx.Exec(`INSERT INTO opaque_envelope_dedup(envelope_hash, mailbox_hash, payload_hash, submitter_hash, expires_at) VALUES (?, ?, ?, ?, ?)`, envelopeHash[:], mailboxHash[:], payloadHash[:], userHash[:], expiresAt); err != nil {
@@ -220,15 +268,32 @@ func (d *Database) DeleteOpaqueHeldMessage(id, mailboxID string) error {
 }
 
 func (d *Database) DeleteExpiredOpaqueHeldMessages() error {
+	_, err := d.ExpireOpaqueHeldMessages()
+	return err
+}
+
+func (d *Database) ExpireOpaqueHeldMessages() (int64, error) {
 	now := time.Now().Unix()
-	_, err := d.DB.Exec(`DELETE FROM opaque_held_messages WHERE expires_at <= ?`, now)
+	tx, err := d.DB.Begin()
 	if err != nil {
-		return fmt.Errorf("delete expired opaque held messages: %w", err)
+		return 0, fmt.Errorf("begin held-envelope expiration: %w", err)
 	}
-	if _, err := d.DB.Exec(`DELETE FROM opaque_envelope_dedup WHERE expires_at <= ?`, now); err != nil {
-		return fmt.Errorf("delete expired envelope replay records: %w", err)
+	defer tx.Rollback()
+	result, err := tx.Exec(`DELETE FROM opaque_held_messages WHERE expires_at <= ?`, now)
+	if err != nil {
+		return 0, fmt.Errorf("delete expired opaque held messages: %w", err)
 	}
-	return nil
+	deleted, err := result.RowsAffected()
+	if err != nil {
+		return 0, fmt.Errorf("count expired held messages: %w", err)
+	}
+	if _, err := tx.Exec(`DELETE FROM opaque_envelope_dedup WHERE expires_at <= ?`, now); err != nil {
+		return 0, fmt.Errorf("delete expired envelope replay records: %w", err)
+	}
+	if err := tx.Commit(); err != nil {
+		return 0, fmt.Errorf("commit held-envelope expiration: %w", err)
+	}
+	return deleted, nil
 }
 
 func (d *Database) backfillOpaqueEnvelopeDedup() error {
@@ -298,6 +363,13 @@ func (d *Database) SetOwnedMailboxRoute(mailboxID, address string, expiresAt int
 	var storedHash []byte
 	err = tx.QueryRow(`SELECT owner_key_hash FROM mailbox_owners WHERE mailbox_id = ?`, mailboxID).Scan(&storedHash)
 	if errors.Is(err, sql.ErrNoRows) {
+		var globalOwnerCount int
+		if err := tx.QueryRow(`SELECT COUNT(*) FROM mailbox_owners`).Scan(&globalOwnerCount); err != nil {
+			return fmt.Errorf("count Daddy mailbox registrations: %w", err)
+		}
+		if globalOwnerCount >= d.limits.MailboxOwnersGlobal {
+			return fmt.Errorf("Daddy mailbox registration quota exceeded")
+		}
 		if _, err := tx.Exec(`INSERT INTO mailbox_owners(mailbox_id, owner_key_hash) VALUES (?, ?)`, mailboxID, ownerHash[:]); err != nil {
 			return fmt.Errorf("claim mailbox ownership: %w", err)
 		}
@@ -305,6 +377,17 @@ func (d *Database) SetOwnedMailboxRoute(mailboxID, address string, expiresAt int
 		return fmt.Errorf("read mailbox ownership: %w", err)
 	} else if !sameDigest(storedHash, ownerHash[:]) {
 		return fmt.Errorf("mailbox is owned by a different authenticated identity")
+	}
+	var activeRouteCount int
+	if err := tx.QueryRow(`
+		SELECT COUNT(*) FROM mailbox_routes AS routes
+		JOIN mailbox_owners AS owners ON owners.mailbox_id = routes.mailbox_id
+		WHERE owners.owner_key_hash = ? AND routes.expires_at > ? AND routes.mailbox_id != ?
+	`, ownerHash[:], time.Now().Unix(), mailboxID).Scan(&activeRouteCount); err != nil {
+		return fmt.Errorf("count active owner routes: %w", err)
+	}
+	if activeRouteCount >= d.limits.RoutesPerIdentity {
+		return fmt.Errorf("mailbox route registration quota exceeded")
 	}
 	if _, err := tx.Exec(`
 		INSERT INTO mailbox_routes(mailbox_id, address, expires_at, last_seen)
@@ -400,11 +483,20 @@ func (d *Database) GetMailboxRouteWithExpiry(mailboxID string) (string, int64, e
 }
 
 func (d *Database) DeleteExpiredMailboxRoutes() error {
-	_, err := d.DB.Exec(`DELETE FROM mailbox_routes WHERE expires_at <= ?`, time.Now().Unix())
+	_, err := d.DeleteExpiredMailboxRoutesCount()
+	return err
+}
+
+func (d *Database) DeleteExpiredMailboxRoutesCount() (int64, error) {
+	result, err := d.DB.Exec(`DELETE FROM mailbox_routes WHERE expires_at <= ?`, time.Now().Unix())
 	if err != nil {
-		return fmt.Errorf("delete expired mailbox routes: %w", err)
+		return 0, fmt.Errorf("delete expired mailbox routes: %w", err)
 	}
-	return nil
+	deleted, err := result.RowsAffected()
+	if err != nil {
+		return 0, fmt.Errorf("count expired mailbox routes: %w", err)
+	}
+	return deleted, nil
 }
 
 // MarkMessageDeliveredFromReceipt applies an authenticated recipient receipt

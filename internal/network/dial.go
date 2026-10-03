@@ -11,6 +11,7 @@ import (
 	"crypto/ecdh"
 	"crypto/ed25519"
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/json"
 	"fmt"
 	"net"
@@ -137,10 +138,10 @@ func negotiateAsInitiator(
 func negotiateAsResponder(
 	conn net.Conn,
 	local *identity.Identity,
-) (*Session, error) {
+) (*Session, string, error) {
 	data, err := readFrameLimit(conn, maxHandshakeFrameSize)
 	if err != nil {
-		return nil, fmt.Errorf(
+		return nil, "", fmt.Errorf(
 			"read hello: %w",
 			err,
 		)
@@ -149,20 +150,28 @@ func negotiateAsResponder(
 	var peerHello handshakeHello
 
 	if err := json.Unmarshal(data, &peerHello); err != nil {
-		return nil, fmt.Errorf(
+		return nil, "", fmt.Errorf(
 			"unmarshal hello: %w",
 			err,
 		)
 	}
+	attemptIdentity := ""
+	if peerHello.Namespace != "" && peerHello.PublicKey != "" {
+		attemptHash := sha256.Sum256([]byte(peerHello.Namespace + "\x00" + peerHello.PublicKey))
+		attemptIdentity = fmt.Sprintf("identity:%x", attemptHash)
+		if !handshakeFailureLimiter.allow(attemptIdentity, time.Now()) {
+			return nil, attemptIdentity, fmt.Errorf("handshake identity temporarily throttled")
+		}
+	}
 
 	localHello, ephemeral, err := newHello(local)
 	if err != nil {
-		return nil, err
+		return nil, attemptIdentity, err
 	}
 
 	ackData, err := json.Marshal(localHello)
 	if err != nil {
-		return nil, fmt.Errorf(
+		return nil, attemptIdentity, fmt.Errorf(
 			"marshal hello ack: %w",
 			err,
 		)
@@ -173,14 +182,14 @@ func negotiateAsResponder(
 		Data: ackData,
 	})
 	if err != nil {
-		return nil, fmt.Errorf(
+		return nil, attemptIdentity, fmt.Errorf(
 			"marshal hello ack envelope: %w",
 			err,
 		)
 	}
 
 	if err := writeFrame(conn, ack); err != nil {
-		return nil, fmt.Errorf(
+		return nil, attemptIdentity, fmt.Errorf(
 			"send hello ack: %w",
 			err,
 		)
@@ -195,10 +204,10 @@ func negotiateAsResponder(
 		localHello,
 		&peerHello,
 	); err != nil {
-		return nil, err
+		return nil, attemptIdentity, err
 	}
 
-	return session, nil
+	return session, attemptIdentity, nil
 }
 
 // recordPeer remembers an authenticated peer identity and, when the peer's

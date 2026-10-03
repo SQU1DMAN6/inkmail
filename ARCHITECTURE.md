@@ -216,9 +216,30 @@ Direct peers still authenticate one another by cryptographic identity. These
 changes do not provide Tor-like anonymity or traffic-analysis resistance.
 
 Protocol v4 binds anonymous-session status into the signed handshake; earlier
-protocol versions fail negotiation clearly. A v2 database with pending identity-bearing relay
-holds fails startup with a drain-before-upgrade error rather than silently
-discarding or retaining those records.
+protocol versions fail negotiation clearly. Database upgrades keep legacy
+relay tables and route rows instead of dropping or clearing them. Existing
+`~/.inkmail` data therefore needs no manual cleanup; legacy rows remain
+preserved in place and are not reinterpreted as current opaque envelopes.
+
+The 1.2 development daemon bounds inbound connections per source and globally,
+concurrent handshakes and requests per identity, request rates by identity,
+source, and mailbox, and failed handshake retries by source and hashed claimed
+identity. Held-envelope counts and bytes are capped per submitter, per mailbox,
+and globally; replay records, local outbox bytes/counts, mailbox ownership,
+peer identities, and direct routes are capped as well. Expired mailbox and
+direct routes are cleaned on the daemon cleanup cycle.
+
+The optional JSON file passed through `inkmaild --resources` has safe defaults,
+validated ranges, and hard ceilings. Fixed frame, handshake, individual
+envelope, fetch-batch, and retention ceilings cannot be raised. Startup leaves
+legacy tables and routes in place. Legacy relay table rows and stored-value
+bytes count against the global held-storage quota; current admission does not
+rewrite or activate those rows.
+
+The daemon emits bounded operational counters once per minute. Local TCP
+integration coverage is in `internal/network/resource_integration_test.go`;
+database upgrade/quota cases are in `internal/database/mailbox_privacy_test.go`.
+See `doc/BUILD-v1_2-REVIEW.md` for the combined-specification coverage ledger.
 
 ## 9. Daemon and CLI split
 

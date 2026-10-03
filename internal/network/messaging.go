@@ -21,12 +21,37 @@ func HandleConnection(
 	local *identity.Identity,
 	db *database.Database,
 ) error {
-	session, err := acceptSession(conn, local, db)
+	source := "source:" + sourceAddressKey(conn.RemoteAddr())
+	if !handshakeFailureLimiter.allow(source, time.Now()) {
+		runtimeStats.rejectedHandshakes.Add(1)
+		_ = conn.Close()
+		return errors.New("handshake source temporarily throttled")
+	}
+	select {
+	case handshakeSlots <- struct{}{}:
+	default:
+		runtimeStats.rejectedHandshakes.Add(1)
+		_ = conn.Close()
+		return errors.New("handshake capacity exceeded")
+	}
+	session, attemptIdentity, err := acceptSession(conn, local, db)
+	<-handshakeSlots
 	if err != nil {
+		handshakeFailureLimiter.failed(source, time.Now())
+		if attemptIdentity != "" {
+			handshakeFailureLimiter.failed(attemptIdentity, time.Now())
+		}
+		runtimeStats.failedHandshakes.Add(1)
 		return err
+	}
+	handshakeFailureLimiter.succeeded(source)
+	if attemptIdentity != "" {
+		handshakeFailureLimiter.succeeded(attemptIdentity)
 	}
 
 	defer session.Close()
+	runtimeStats.authenticatedSession.Add(1)
+	defer runtimeStats.authenticatedSession.Add(-1)
 
 	return serveSession(session, local, db)
 }
@@ -35,20 +60,20 @@ func acceptSession(
 	conn net.Conn,
 	local *identity.Identity,
 	db *database.Database,
-) (*Session, error) {
+) (*Session, string, error) {
 	if err := conn.SetDeadline(
 		time.Now().Add(effectiveSessionTimeout()),
 	); err != nil {
 		_ = conn.Close()
 
-		return nil, err
+		return nil, "", err
 	}
 
-	session, err := negotiateAsResponder(conn, local)
+	session, attemptIdentity, err := negotiateAsResponder(conn, local)
 	if err != nil {
 		_ = conn.Close()
 
-		return nil, err
+		return nil, attemptIdentity, err
 	}
 
 	address := ""
@@ -59,7 +84,7 @@ func acceptSession(
 
 	recordInboundPeer(db, session, address)
 
-	return session, nil
+	return session, attemptIdentity, nil
 }
 
 func serveSession(
@@ -68,34 +93,31 @@ func serveSession(
 	db *database.Database,
 ) error {
 	for exchanges := 0; exchanges < maxSessionRequests; exchanges++ {
-		var request Message
-
-		if err := receiveMessage(session, &request); err != nil {
-			if errors.Is(err, io.EOF) ||
-				errors.Is(err, net.ErrClosed) {
-				return nil
-			}
-
-			return fmt.Errorf(
-				"read request: %w",
-				err,
-			)
+		identityKey := session.PeerFingerprint()
+		if !inFlightRequests.acquire(identityKey) {
+			runtimeStats.rejectedRequests.Add(1)
+			return errors.New("concurrent request capacity exceeded")
 		}
-
-		if session.Conn != nil {
-			if err := session.Conn.SetDeadline(
-				time.Now().Add(effectiveSessionTimeout()),
-			); err != nil {
-				return err
+		err := func() error {
+			defer inFlightRequests.release(identityKey)
+			var request Message
+			if err := receiveMessage(session, &request); err != nil {
+				if errors.Is(err, io.EOF) || errors.Is(err, net.ErrClosed) {
+					return io.EOF
+				}
+				return fmt.Errorf("read request: %w", err)
 			}
+			if session.Conn != nil {
+				if err := session.Conn.SetDeadline(time.Now().Add(effectiveSessionTimeout())); err != nil {
+					return err
+				}
+			}
+			return dispatchRequest(session, local, db, request)
+		}()
+		if errors.Is(err, io.EOF) {
+			return nil
 		}
-
-		if err := dispatchRequest(
-			session,
-			local,
-			db,
-			request,
-		); err != nil {
+		if err != nil {
 			return err
 		}
 	}
@@ -111,7 +133,28 @@ func dispatchRequest(
 	local *identity.Identity,
 	db *database.Database,
 	request Message,
-) error {
+) (err error) {
+	defer func() {
+		if err != nil {
+			runtimeStats.rejectedRequests.Add(1)
+		}
+	}()
+	now := time.Now()
+	var remoteAddress net.Addr
+	if session.Conn != nil {
+		remoteAddress = session.Conn.RemoteAddr()
+	}
+	if !requestRateLimiter.allow("identity:"+session.PeerFingerprint(), now) ||
+		!requestRateLimiter.allow("source:"+sourceAddressKey(remoteAddress), now) {
+		runtimeStats.rateLimitEvents.Add(1)
+		return fmt.Errorf("authenticated request rate limit exceeded")
+	}
+	if mailboxID := requestMailboxID(request); mailboxID != "" &&
+		!requestRateLimiter.allow("mailbox:"+mailboxID, now) {
+		runtimeStats.rateLimitEvents.Add(1)
+		return fmt.Errorf("mailbox request rate limit exceeded")
+	}
+
 	switch request.Type {
 	case messageTypeMessage:
 		return handleIncomingMessage(session, local, db, request.Data)
@@ -142,6 +185,22 @@ func dispatchRequest(
 			"unsupported protocol message %q",
 			request.Type,
 		)
+	}
+}
+
+func requestMailboxID(request Message) string {
+	switch request.Type {
+	case messageTypeRegisterRoute, messageTypeLookupRoute, messageTypeHoldMessage,
+		messageTypeFetchMessages, messageTypeDeliveryAck:
+		var body struct {
+			MailboxID string `json:"mailbox_id"`
+		}
+		if err := json.Unmarshal(request.Data, &body); err != nil || message.ValidateMailboxID(body.MailboxID) != nil {
+			return ""
+		}
+		return strings.ToLower(body.MailboxID)
+	default:
+		return ""
 	}
 }
 

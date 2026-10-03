@@ -210,7 +210,7 @@ func handleRegisterRoute(
 		return replyRegistration(
 			session,
 			statusRejected,
-			err.Error(),
+			safeRouteRegistrationReason(err),
 			0,
 		)
 	}
@@ -303,6 +303,15 @@ func handleHoldMessage(
 	data []byte,
 ) error {
 	var envelope message.MailboxEnvelope
+	accepted := false
+	defer func() {
+		if accepted {
+			runtimeStats.acceptedMessages.Add(1)
+		} else {
+			runtimeStats.rejectedMessages.Add(1)
+			runtimeStats.rejectedBytes.Add(uint64(len(data)))
+		}
+	}()
 
 	if len(data) > database.MaxOpaqueEnvelopeSize {
 		return replyHold(session, "", statusRejected, "held envelope exceeds size limit")
@@ -325,11 +334,18 @@ func handleHoldMessage(
 	expiresAt := time.Now().Add(HeldMessageTTL * time.Second).Unix()
 	stored, err := db.StoreOpaqueHeldMessageForUser(envelope.ID, envelope.MailboxID, payload, expiresAt, session.Peer)
 	if err != nil {
-		return replyHold(session, envelope.ID, statusRejected, err.Error())
+		reason := "storage admission failed"
+		if strings.Contains(err.Error(), "quota exceeded") {
+			reason = "relay storage quota exceeded"
+		}
+		return replyHold(session, envelope.ID, statusRejected, reason)
 	}
 	if !stored {
+		runtimeStats.replayRejections.Add(1)
 		return replyHold(session, envelope.ID, statusAlreadyStored, "")
 	}
+	accepted = true
+	runtimeStats.acceptedBytes.Add(uint64(len(payload)))
 
 	// HOLD_ACK means "accepted", not "delivered" (SPEC section 24).
 	if err := replyHold(session, envelope.ID, statusHeld, ""); err != nil {
@@ -341,6 +357,16 @@ func handleHoldMessage(
 	scheduleRelayHeldMessage(local, db, envelope, session.Peer)
 
 	return nil
+}
+
+func safeRouteRegistrationReason(err error) string {
+	if strings.Contains(err.Error(), "quota exceeded") {
+		return "route registration quota exceeded"
+	}
+	if strings.Contains(err.Error(), "owned by a different authenticated identity") {
+		return "mailbox ownership conflict"
+	}
+	return "route registration failed"
 }
 
 func replyDelivery(
@@ -1026,20 +1052,30 @@ func ResolveAndSend(
 // StartCleanupRoutine removes expired opaque envelopes and mailbox routes.
 func StartCleanupRoutine(db *database.Database) func() {
 	done := make(chan struct{})
+	stopped := make(chan struct{})
 	ticker := time.NewTicker(DefaultCleanupPeriod)
 	go func() {
+		defer close(stopped)
 		for {
 			select {
 			case <-ticker.C:
-				_ = db.DeleteExpiredOpaqueHeldMessages()
-				_ = db.DeleteExpiredMailboxRoutes()
+				if expired, err := db.ExpireOpaqueHeldMessages(); err == nil {
+					runtimeStats.expiredEnvelopes.Add(uint64(expired))
+				}
+				_, _ = db.DeleteExpiredMailboxRoutesCount()
+				if expired, err := db.DeleteExpiredRoutesCount(); err == nil {
+					runtimeStats.expiredPeerRoutes.Add(uint64(expired))
+				}
 			case <-done:
 				ticker.Stop()
 				return
 			}
 		}
 	}()
-	return func() { close(done) }
+	return func() {
+		close(done)
+		<-stopped
+	}
 }
 
 // DialPersistent periodically registers this opaque mailbox route and fetches
@@ -1102,9 +1138,6 @@ func DialPersistentWithRetry(
 			fmt.Printf("Daddy: cannot store address: %v\n", err)
 		}
 	}
-
-	stopCleanup := StartCleanupRoutine(db)
-	defer stopCleanup()
 
 	refresh := func(registerRoutes bool) (bool, bool, bool) {
 		connected := true

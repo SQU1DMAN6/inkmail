@@ -12,6 +12,7 @@ import (
 	"github.com/SQU1DMAN6/inkmail/internal/database"
 	"github.com/SQU1DMAN6/inkmail/internal/identity"
 	"github.com/SQU1DMAN6/inkmail/internal/network"
+	"github.com/SQU1DMAN6/inkmail/internal/resource"
 )
 
 const defaultDaddy = "129.150.63.22:25565"
@@ -56,7 +57,18 @@ func main() {
 		"path to relays.conf (defaults to <data>/relays.conf)",
 	)
 
+	resourcesPath := flag.String(
+		"resources",
+		"",
+		"path to Daddy resource-limits JSON (safe defaults apply when omitted)",
+	)
+
 	flag.Parse()
+	limits, err := resource.Load(*resourcesPath)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "invalid resource configuration: %v\n", err)
+		os.Exit(2)
+	}
 	if err := network.ValidateDaddyRetryInterval(*retryInterval); err != nil {
 		fmt.Fprintf(os.Stderr, "invalid retry interval: %v\n", err)
 		os.Exit(2)
@@ -115,6 +127,16 @@ func main() {
 	}
 
 	defer db.DB.Close()
+	if err := db.SetResourceLimits(limits); err != nil {
+		fmt.Fprintf(os.Stderr, "invalid database resource limits: %v\n", err)
+		os.Exit(2)
+	}
+	if err := network.ConfigureResourceLimits(limits); err != nil {
+		fmt.Fprintf(os.Stderr, "configure network resource limits: %v\n", err)
+		os.Exit(2)
+	}
+	stopCleanup := network.StartCleanupRoutine(db)
+	defer stopCleanup()
 
 	relaysFile := *relaysPath
 
@@ -153,6 +175,11 @@ func main() {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
+	metricsDone := make(chan struct{})
+	go func() {
+		defer close(metricsDone)
+		network.ReportResourceMetrics(ctx, db)
+	}()
 	workerDone := make(chan struct{})
 	go func() {
 		defer close(workerDone)
@@ -172,6 +199,7 @@ func main() {
 	<-signals
 	cancel()
 	<-workerDone
+	<-metricsDone
 
 	fmt.Println(
 		"Shutting down InkMail...",
